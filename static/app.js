@@ -1,5 +1,5 @@
-import { Pcm24kPlayer } from "/static/audio-player.js";
-import { QwenWebRtcClient } from "/static/qwen-webrtc.js";
+import { Pcm24kPlayer } from "/static/audio-player.js?v=3";
+import { QwenWebRtcClient } from "/static/qwen-webrtc.js?v=3";
 
 const STORAGE_KEY = "sermon_live_translator_prefs_v6";
 const PREV_STORAGE_KEY = "sermon_live_translator_prefs_v5";
@@ -1158,15 +1158,17 @@ function sendBroadcastJson(payload) {
   }
 }
 
-function sendBroadcastAudio(pcmBuffer, turnId) {
+function sendBroadcastAudio(pcmBuffer, turnId, sampleRate = 24000) {
   const ws = state.broadcastWs;
   if (!ws || ws.readyState !== WebSocket.OPEN || !pcmBuffer) return;
   if (state.broadcastInfo.listenerCount <= 0) return;
-  // Pack 4-byte uint32 LE turnId + raw 24kHz Int16 PCM
-  const frame = new Uint8Array(4 + pcmBuffer.byteLength);
+  // Pack 6-byte header: uint32 LE turnId + uint16 LE exact sampleRate + raw Int16 PCM
+  const safeRate = Math.max(8000, Math.min(48000, Math.round(Number(sampleRate) || 24000)));
+  const frame = new Uint8Array(6 + pcmBuffer.byteLength);
   const view = new DataView(frame.buffer);
   view.setUint32(0, Math.max(0, Number(turnId) || 0), true);
-  frame.set(new Uint8Array(pcmBuffer), 4);
+  view.setUint16(4, safeRate, true);
+  frame.set(new Uint8Array(pcmBuffer), 6);
   ws.send(frame.buffer);
 }
 
@@ -1219,8 +1221,8 @@ async function startQwenWebRtcSession() {
       setSpeakingTurn(turnId);
       sendBroadcastJson({ type: "active_turn", turn_id: turnId });
     },
-    onRemotePcm: (pcmBuffer, turnId) => {
-      sendBroadcastAudio(pcmBuffer, turnId);
+    onRemotePcm: (pcmBuffer, turnId, sampleRate) => {
+      sendBroadcastAudio(pcmBuffer, turnId, sampleRate);
     },
     onTargetDelta: (turnId, delta) => {
       appendTargetTranscript(turnId, delta);

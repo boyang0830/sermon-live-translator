@@ -424,7 +424,7 @@ def test_mode2_1_to_n_fanout_ulaw_audio_late_join_and_pin(tmp_path, monkeypatch)
                 }
             )
             pcm_samples = b"\x00\x10\x00\xf0" * 100  # 400 bytes -> 200 samples -> 200 ulaw bytes
-            sb_ws.send_bytes(struct.pack("<I", 7) + pcm_samples)
+            sb_ws.send_bytes(struct.pack("<IH", 7, 24000) + pcm_samples)
 
             # Helper to drain listener_count notifications until target event
             def next_non_count_json(ws):
@@ -443,23 +443,25 @@ def test_mode2_1_to_n_fanout_ulaw_audio_late_join_and_pin(tmp_path, monkeypatch)
             b1 = phone1.receive_bytes()
             b2 = phone2.receive_bytes()
             assert b1 == b2
-            codec, turn_id = struct.unpack("<BI", b1[:5])
-            assert codec == 1  # Lossless 24kHz Int16 PCM for <= 25 listeners
+            codec, turn_id, sr = struct.unpack("<BIH", b1[:7])
+            assert codec == 3  # Lossless Int16 PCM with explicit sampleRate for <= 25 listeners
             assert turn_id == 7
-            assert b1[5:] == pcm_samples
+            assert sr == 24000
+            assert b1[7:] == pcm_samples
 
-            # Also verify adaptive μ-law codec (codec=2) activates when > PCM_LOSSLESS_MAX_LISTENERS
+            # Also verify adaptive μ-law codec (codec=4) activates when > PCM_LOSSLESS_MAX_LISTENERS
             orig_limit = server.broadcast_hub.PCM_LOSSLESS_MAX_LISTENERS
             try:
                 server.broadcast_hub.PCM_LOSSLESS_MAX_LISTENERS = 1
-                sb_ws.send_bytes(struct.pack("<I", 8) + pcm_samples)
+                sb_ws.send_bytes(struct.pack("<IH", 8, 48000) + pcm_samples)
                 b1_ulaw = phone1.receive_bytes()
                 b2_ulaw = phone2.receive_bytes()
                 assert b1_ulaw == b2_ulaw
-                codec_u, turn_u = struct.unpack("<BI", b1_ulaw[:5])
-                assert codec_u == 2  # G.711 μ-law 24kHz
+                codec_u, turn_u, sr_u = struct.unpack("<BIH", b1_ulaw[:7])
+                assert codec_u == 4  # G.711 μ-law with explicit sampleRate
                 assert turn_u == 8
-                assert len(b1_ulaw) == 5 + len(pcm_samples) // 2
+                assert sr_u == 48000
+                assert len(b1_ulaw) == 7 + len(pcm_samples) // 2
             finally:
                 server.broadcast_hub.PCM_LOSSLESS_MAX_LISTENERS = orig_limit
 

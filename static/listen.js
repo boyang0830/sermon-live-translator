@@ -1,4 +1,4 @@
-import { Pcm24kPlayer } from "/static/audio-player.js";
+import { Pcm24kPlayer } from "/static/audio-player.js?v=3";
 
 const PREFS_KEY = "sermon_listener_prefs_v2";
 const PIN_SESSION_KEY = "sermon_listener_pin";
@@ -716,10 +716,16 @@ function handleBinaryAudio(arrayBuffer) {
     state.lastServerTurnId = turnId;
   }
 
-  if (codec === 1) {
-    player.enqueuePcm16(arrayBuffer.slice(5), turnId);
+  if (codec === 3 && arrayBuffer.byteLength >= 9) {
+    const sampleRate = view.getUint16(5, true) || 24000;
+    player.enqueuePcm16(arrayBuffer.slice(7), turnId, sampleRate);
+  } else if (codec === 4 && arrayBuffer.byteLength >= 8) {
+    const sampleRate = view.getUint16(5, true) || 24000;
+    player.enqueueUlaw24k(new Uint8Array(arrayBuffer, 7), turnId, sampleRate);
+  } else if (codec === 1) {
+    player.enqueuePcm16(arrayBuffer.slice(5), turnId, 24000);
   } else if (codec === 2) {
-    player.enqueueUlaw24k(new Uint8Array(arrayBuffer, 5), turnId);
+    player.enqueueUlaw24k(new Uint8Array(arrayBuffer, 5), turnId, 24000);
   }
 }
 

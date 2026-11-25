@@ -42,6 +42,8 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
@@ -825,6 +827,8 @@ class BroadcastHub:
 
     AUDIO_CODEC_PCM16_24K = 1
     AUDIO_CODEC_ULAW_24K = 2
+    AUDIO_CODEC_PCM16_SR = 3
+    AUDIO_CODEC_ULAW_SR = 4
     PCM_LOSSLESS_MAX_LISTENERS = 25
 
     def __init__(self) -> None:
@@ -1047,7 +1051,12 @@ class BroadcastHub:
         for q in list(self._listeners.values()):
             self._enqueue_listener(q, ("text", text))
 
-    async def broadcast_audio(self, pcm_bytes: bytes, turn_id: int | None = None) -> None:
+    async def broadcast_audio(
+        self,
+        pcm_bytes: bytes,
+        turn_id: int | None = None,
+        sample_rate: int = 24000,
+    ) -> None:
         if not pcm_bytes:
             return
         # 1. Soundbooth local WS playback (raw 24kHz Int16 PCM)
@@ -1062,24 +1071,35 @@ class BroadcastHub:
         for ws in stale:
             self._soundbooth.pop(ws, None)
 
-        # 2. Congregation mobile listeners:
-        #    - <= 25 listeners: lossless 24kHz Int16 PCM (codec 1) for 100% timbre parity with soundbooth
-        #    - > 25 listeners: 24kHz G.711 μ-law (codec 2, 2x smaller) to protect church Wi-Fi bandwidth
+        # 2. Congregation mobile listeners (7-byte header: uint8 codec + uint32 turnId + uint16 sampleRate):
+        #    - <= 25 listeners: lossless Int16 PCM (codec 3) with exact sampleRate for 100% timbre & pitch parity
+        #    - > 25 listeners: G.711 μ-law (codec 4, 2x smaller) with exact sampleRate to protect church Wi-Fi
         listener_count = len(self._listeners)
         if listener_count > 0:
             effective_turn = turn_id if turn_id is not None else (self.active_turn_id or 0)
+            safe_rate = max(8000, min(48000, int(sample_rate or 24000)))
             usable = len(pcm_bytes) & ~1
             if usable > 0:
                 clean_pcm = pcm_bytes[:usable]
                 if listener_count <= self.PCM_LOSSLESS_MAX_LISTENERS:
                     frame = (
-                        struct.pack("<BI", self.AUDIO_CODEC_PCM16_24K, max(0, int(effective_turn)))
+                        struct.pack(
+                            "<BIH",
+                            self.AUDIO_CODEC_PCM16_SR,
+                            max(0, int(effective_turn)),
+                            safe_rate,
+                        )
                         + clean_pcm
                     )
                 else:
                     ulaw_payload = pcm16_to_ulaw(clean_pcm)
                     frame = (
-                        struct.pack("<BI", self.AUDIO_CODEC_ULAW_24K, max(0, int(effective_turn)))
+                        struct.pack(
+                            "<BIH",
+                            self.AUDIO_CODEC_ULAW_SR,
+                            max(0, int(effective_turn)),
+                            safe_rate,
+                        )
                         + ulaw_payload
                     )
                 for q in list(self._listeners.values()):
@@ -2677,11 +2697,13 @@ async def ws_broadcast(websocket: WebSocket) -> None:
 
             raw_bytes = message.get("bytes")
             if raw_bytes is not None:
-                if len(raw_bytes) >= 6:
-                    turn_id = struct.unpack("<I", raw_bytes[:4])[0]
-                    pcm_bytes = raw_bytes[4:]
+                if len(raw_bytes) >= 8:
+                    turn_id, sample_rate = struct.unpack("<IH", raw_bytes[:6])
+                    pcm_bytes = raw_bytes[6:]
                     await broadcast_hub.broadcast_audio(
-                        pcm_bytes, turn_id=turn_id or None
+                        pcm_bytes,
+                        turn_id=turn_id or None,
+                        sample_rate=sample_rate or 24000,
                     )
                 continue
 
@@ -2825,6 +2847,18 @@ routes = [
     Mount("/static", app=StaticFiles(directory=STATIC_DIR), name="static"),
 ]
 
+class NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    """Prevent Chrome & iOS Safari from serving stale cached JS/AudioWorklet modules."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path in ("/", "/listen") or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+
 @asynccontextmanager
 async def lifespan(_app: Starlette):
     try:
@@ -2833,7 +2867,11 @@ async def lifespan(_app: Starlette):
         await tunnel_manager.stop()
 
 
-app = Starlette(routes=routes, lifespan=lifespan)
+app = Starlette(
+    routes=routes,
+    lifespan=lifespan,
+    middleware=[Middleware(NoCacheStaticMiddleware)],
+)
 
 if __name__ == "__main__":
     import uvicorn

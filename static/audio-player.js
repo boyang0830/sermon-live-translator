@@ -315,7 +315,7 @@ export class Pcm24kPlayer {
     this._emitTurn(null);
   }
 
-  _scheduleFloat32(float32, turnId = null) {
+  _scheduleFloat32(float32, turnId = null, sampleRate = null) {
     if (!this.ctx || !float32 || float32.length === 0) {
       return;
     }
@@ -324,6 +324,11 @@ export class Pcm24kPlayer {
       this.ctx.resume().catch(() => {});
       return;
     }
+
+    const rate =
+      Number.isFinite(sampleRate) && sampleRate >= 8000 && sampleRate <= 96000
+        ? sampleRate
+        : this.sampleRate;
 
     if (this.onAudioLevel) {
       let sum = 0;
@@ -350,13 +355,14 @@ export class Pcm24kPlayer {
     }
 
     // Apply tiny 3ms fade-in when re-anchoring after a pause/underrun to eliminate clicks
-    if (isReanchor && float32.length > 72) {
-      for (let i = 0; i < 72; i++) {
-        float32[i] *= i / 72;
+    const fadeSamples = Math.min(float32.length, Math.round(rate * 0.003));
+    if (isReanchor && fadeSamples > 4) {
+      for (let i = 0; i < fadeSamples; i++) {
+        float32[i] *= i / fadeSamples;
       }
     }
 
-    const audioBuffer = this.ctx.createBuffer(1, float32.length, this.sampleRate);
+    const audioBuffer = this.ctx.createBuffer(1, float32.length, rate);
     audioBuffer.copyToChannel(float32, 0);
 
     const source = this.ctx.createBufferSource();
@@ -386,7 +392,7 @@ export class Pcm24kPlayer {
     };
   }
 
-  enqueuePcm16(arrayBuffer, turnId = null) {
+  enqueuePcm16(arrayBuffer, turnId = null, sampleRate = null) {
     if (!this.ctx || !arrayBuffer || arrayBuffer.byteLength < 2) {
       return;
     }
@@ -395,10 +401,10 @@ export class Pcm24kPlayer {
     for (let i = 0; i < int16.length; i++) {
       float32[i] = int16[i] / 32768;
     }
-    this._scheduleFloat32(float32, turnId);
+    this._scheduleFloat32(float32, turnId, sampleRate);
   }
 
-  enqueueUlaw24k(uint8View, turnId = null) {
+  enqueueUlaw24k(uint8View, turnId = null, sampleRate = null) {
     if (!this.ctx || !uint8View || uint8View.byteLength < 1) {
       return;
     }
@@ -406,7 +412,7 @@ export class Pcm24kPlayer {
     for (let i = 0; i < uint8View.length; i++) {
       float32[i] = ULAW_DECODE_LUT[uint8View[i]];
     }
-    this._scheduleFloat32(float32, turnId);
+    this._scheduleFloat32(float32, turnId, sampleRate);
   }
 
   clearQueue() {

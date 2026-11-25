@@ -495,7 +495,14 @@ export class QwenWebRtcClient {
   async _attachRemoteAudioMonitor(stream) {
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      this.remoteAnalyserCtx = new AudioCtx();
+      // Prefer 24kHz so Chrome's native C++ Sinc resampler produces clean 24kHz broadcast audio;
+      // even if a browser chooses another native rate, broadcast-pcm-worklet reports its exact
+      // `sampleRate` in every packet so phones ALWAYS match pitch and timbre 100%.
+      try {
+        this.remoteAnalyserCtx = new AudioCtx({ sampleRate: 24000 });
+      } catch {
+        this.remoteAnalyserCtx = new AudioCtx();
+      }
       if (this.remoteAnalyserCtx.state === "suspended") {
         await this.remoteAnalyserCtx.resume().catch(() => {});
       }
@@ -504,19 +511,20 @@ export class QwenWebRtcClient {
       this.remoteAnalyser.fftSize = 512;
       src.connect(this.remoteAnalyser);
 
-      // Mode 2 broadcast tap: capture clean 24kHz Int16 PCM (40ms chunks) from WebRTC remote audio
-      // so the single Qwen WebRTC stream can be fanned out to N congregation phones with studio parity.
+      // Mode 2 broadcast tap: dedicated zero-resample worklet (cache-busted URL)
       if (typeof this.cb.onRemotePcm === "function" && this.remoteAnalyserCtx.audioWorklet) {
         try {
-          await this.remoteAnalyserCtx.audioWorklet.addModule("/static/audio-capture-worklet.js");
+          await this.remoteAnalyserCtx.audioWorklet.addModule(
+            "/static/broadcast-pcm-worklet.js?v=3"
+          );
           if (!this.running || !this.remoteAnalyserCtx) return;
-          const worklet = new AudioWorkletNode(this.remoteAnalyserCtx, "pcm-16k-capture", {
-            processorOptions: { targetRate: 24000, chunkMs: 40 },
+          const worklet = new AudioWorkletNode(this.remoteAnalyserCtx, "broadcast-pcm-capture", {
+            processorOptions: { chunkMs: 40 },
           });
           let silentChunks = 0;
           worklet.port.onmessage = (event) => {
             if (!this.running) return;
-            const { pcm, rms } = event.data || {};
+            const { pcm, rms, sampleRate } = event.data || {};
             if (!pcm) return;
             // Gentle silence gate: keep 1.0s tail (25 * 40ms) so soft consonants never clip
             if (rms > 0.0005) {
@@ -528,7 +536,8 @@ export class QwenWebRtcClient {
             const activeTurn =
               this.speakingTurnId ||
               (this.turnHasOutput ? this.turnId : Math.max(1, this.turnId - 1));
-            this.cb.onRemotePcm?.(pcm, activeTurn);
+            const exactRate = Number(sampleRate) || this.remoteAnalyserCtx?.sampleRate || 24000;
+            this.cb.onRemotePcm?.(pcm, activeTurn, exactRate);
           };
           // Connect through a silent GainNode to destination so Chrome ALWAYS clocks the
           // AudioWorklet cleanly without throttling or dropping frames!
