@@ -7,8 +7,13 @@ class Pcm16kCaptureProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
     const requestedRate = Number(options?.processorOptions?.targetRate);
+    const requestedChunkMs = Number(options?.processorOptions?.chunkMs);
     this.targetRate = Number.isFinite(requestedRate) && requestedRate >= 8000 ? requestedRate : 16000;
-    this.chunkSamples = Math.round(this.targetRate * 0.1); // 100ms chunks (1,600 @ 16kHz, 2,400 @ 24kHz)
+    const chunkMs =
+      Number.isFinite(requestedChunkMs) && requestedChunkMs >= 20 && requestedChunkMs <= 200
+        ? requestedChunkMs
+        : 100;
+    this.chunkSamples = Math.round((this.targetRate * chunkMs) / 1000);
     this.buffer = new Int16Array(this.chunkSamples);
     this.writeIndex = 0;
     this.ratio = sampleRate / this.targetRate;
@@ -52,14 +57,29 @@ class Pcm16kCaptureProcessor extends AudioWorkletProcessor {
       this.rmsCount++;
     }
 
-    // Linear interpolation resampling to 16kHz
+    // Anti-aliased resampling to targetRate (box-average window when downsampling prevents
+    // high-frequency aliasing & metallic timbre distortion when converting 48kHz -> 24kHz/16kHz)
     let pos = this.phase;
+    const isDownsampling = this.ratio > 1.05;
     while (pos < frameLength) {
-      const idx = Math.floor(pos);
-      const frac = pos - idx;
-      const s0 = idx === 0 && pos < 0 ? this.lastSample : mono[idx];
-      const s1 = idx + 1 < frameLength ? mono[idx + 1] : mono[frameLength - 1];
-      const sample = s0 + (s1 - s0) * frac;
+      let sample;
+      if (isDownsampling) {
+        const start = Math.floor(pos);
+        const end = Math.min(frameLength, Math.ceil(pos + this.ratio));
+        let acc = 0;
+        let cnt = 0;
+        for (let k = Math.max(0, start); k < end; k++) {
+          acc += mono[k];
+          cnt++;
+        }
+        sample = cnt > 0 ? acc / cnt : mono[Math.min(frameLength - 1, Math.max(0, start))];
+      } else {
+        const idx = Math.floor(pos);
+        const frac = pos - idx;
+        const s0 = idx === 0 && pos < 0 ? this.lastSample : mono[idx];
+        const s1 = idx + 1 < frameLength ? mono[idx + 1] : mono[frameLength - 1];
+        sample = s0 + (s1 - s0) * frac;
+      }
       const clamped = Math.max(-1, Math.min(1, sample));
       this.buffer[this.writeIndex++] =
         clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);

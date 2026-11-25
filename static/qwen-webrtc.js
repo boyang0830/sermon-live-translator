@@ -25,6 +25,7 @@ export class QwenWebRtcClient {
     this.remoteAnalyserCtx = null;
     this.remoteAnalyser = null;
     this.remoteBroadcastNode = null;
+    this.remoteSilentGain = null;
     this._meterRaf = null;
 
     this.running = false;
@@ -503,34 +504,41 @@ export class QwenWebRtcClient {
       this.remoteAnalyser.fftSize = 512;
       src.connect(this.remoteAnalyser);
 
-      // Mode 2 broadcast tap: capture clean 24kHz Int16 PCM from WebRTC remote audio
-      // so the single Qwen WebRTC stream can be fanned out to N congregation phones.
+      // Mode 2 broadcast tap: capture clean 24kHz Int16 PCM (40ms chunks) from WebRTC remote audio
+      // so the single Qwen WebRTC stream can be fanned out to N congregation phones with studio parity.
       if (typeof this.cb.onRemotePcm === "function" && this.remoteAnalyserCtx.audioWorklet) {
         try {
           await this.remoteAnalyserCtx.audioWorklet.addModule("/static/audio-capture-worklet.js");
           if (!this.running || !this.remoteAnalyserCtx) return;
           const worklet = new AudioWorkletNode(this.remoteAnalyserCtx, "pcm-16k-capture", {
-            processorOptions: { targetRate: 24000 },
+            processorOptions: { targetRate: 24000, chunkMs: 40 },
           });
           let silentChunks = 0;
           worklet.port.onmessage = (event) => {
             if (!this.running) return;
             const { pcm, rms } = event.data || {};
             if (!pcm) return;
-            // Gate pure dead-silence after 600ms tail to save church Wi-Fi bandwidth
-            if (rms > 0.002) {
+            // Gentle silence gate: keep 1.0s tail (25 * 40ms) so soft consonants never clip
+            if (rms > 0.0005) {
               silentChunks = 0;
             } else {
               silentChunks++;
-              if (silentChunks > 6) return;
+              if (silentChunks > 25) return;
             }
             const activeTurn =
               this.speakingTurnId ||
               (this.turnHasOutput ? this.turnId : Math.max(1, this.turnId - 1));
             this.cb.onRemotePcm?.(pcm, activeTurn);
           };
+          // Connect through a silent GainNode to destination so Chrome ALWAYS clocks the
+          // AudioWorklet cleanly without throttling or dropping frames!
+          const silentGain = this.remoteAnalyserCtx.createGain();
+          silentGain.gain.value = 0;
           src.connect(worklet);
+          worklet.connect(silentGain);
+          silentGain.connect(this.remoteAnalyserCtx.destination);
           this.remoteBroadcastNode = worklet;
+          this.remoteSilentGain = silentGain;
         } catch (err) {
           console.warn("Unable to attach Mode 2 WebRTC broadcast audio tap:", err);
         }
@@ -692,6 +700,14 @@ export class QwenWebRtcClient {
         // Ignore
       }
       this.remoteBroadcastNode = null;
+    }
+    if (this.remoteSilentGain) {
+      try {
+        this.remoteSilentGain.disconnect();
+      } catch {
+        // Ignore
+      }
+      this.remoteSilentGain = null;
     }
     if (this.remoteAnalyserCtx) {
       await this.remoteAnalyserCtx.close().catch(() => {});

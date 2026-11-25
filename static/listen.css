@@ -158,6 +158,26 @@ body {
   color: var(--warning);
 }
 
+.lang-btn {
+  height: 34px;
+  padding: 0 0.58rem;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lang-btn:active {
+  border-color: var(--accent);
+}
+
 .icon-btn {
   width: 34px;
   height: 34px;

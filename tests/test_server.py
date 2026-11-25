@@ -442,9 +442,24 @@ def test_mode2_1_to_n_fanout_ulaw_audio_late_join_and_pin(tmp_path, monkeypatch)
             b2 = phone2.receive_bytes()
             assert b1 == b2
             codec, turn_id = struct.unpack("<BI", b1[:5])
-            assert codec == 2  # G.711 μ-law 24kHz
+            assert codec == 1  # Lossless 24kHz Int16 PCM for <= 25 listeners
             assert turn_id == 7
-            assert len(b1) == 5 + len(pcm_samples) // 2
+            assert b1[5:] == pcm_samples
+
+            # Also verify adaptive μ-law codec (codec=2) activates when > PCM_LOSSLESS_MAX_LISTENERS
+            orig_limit = server.broadcast_hub.PCM_LOSSLESS_MAX_LISTENERS
+            try:
+                server.broadcast_hub.PCM_LOSSLESS_MAX_LISTENERS = 1
+                sb_ws.send_bytes(struct.pack("<I", 8) + pcm_samples)
+                b1_ulaw = phone1.receive_bytes()
+                b2_ulaw = phone2.receive_bytes()
+                assert b1_ulaw == b2_ulaw
+                codec_u, turn_u = struct.unpack("<BI", b1_ulaw[:5])
+                assert codec_u == 2  # G.711 μ-law 24kHz
+                assert turn_u == 8
+                assert len(b1_ulaw) == 5 + len(pcm_samples) // 2
+            finally:
+                server.broadcast_hub.PCM_LOSSLESS_MAX_LISTENERS = orig_limit
 
             # 4. A 3rd late-joining phone immediately receives recent caption history
             with client.websocket_connect("/ws/listen") as phone3:

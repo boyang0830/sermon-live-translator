@@ -1,21 +1,103 @@
 import { Pcm24kPlayer } from "/static/audio-player.js";
 
-const PREFS_KEY = "sermon_listener_prefs_v1";
+const PREFS_KEY = "sermon_listener_prefs_v2";
 const PIN_SESSION_KEY = "sermon_listener_pin";
+
+const I18N = {
+  zh: {
+    pageTitle: "教会实时同声传译",
+    headerTitle: "教会实时同声传译",
+    langToggleText: "EN",
+    statusLive: "直播中",
+    statusPaused: "暂停中",
+    statusStandby: "待机",
+    statusConnecting: "连接中",
+    subConnecting: "正在连接教会同传频道...",
+    subStandby: "已连接 · 等待讲员开始发言",
+    subLiveFallback: "实时同声传译广播中",
+    subPausedFallback: "唱诗 / 祷告暂停",
+    dirZhEn: "中文 → 英文 · Live English",
+    dirEnZh: "英文 → 中文 · 简体普通话",
+    pauseNotice: "当前为唱诗/祷告暂停时间，讲道恢复后将自动继续播报",
+    unlockTitle: "点击开启实时语音播报",
+    unlockSub: "请佩戴耳机收听 · 支持锁屏播报（息屏如被系统中断点屏即恢复）",
+    resumeTitle: "点击此处恢复实时语音播报",
+    resumeSub: "手机刚从息屏唤醒，轻触任意位置即可恢复声音",
+    placeholderMain: "已连接教会同传频道",
+    placeholderSub: "讲员开始讲道后，实时译文语音与字幕将自动出现。",
+    speakingBadge: "播报中",
+    jumpLatest: "↓ 回到最新字幕",
+    dockEnableAudio: "开启语音",
+    dockAudioLive: "语音中",
+    dockAudioMuted: "已静音",
+    dockResumeAudio: "恢复语音",
+    dockShowSource: "原文",
+    dockHideSource: "隐原文",
+    pinTitle: "输入房间口令",
+    pinDesc: "请输入大屏或音控台显示的口令以加入实时语音与字幕收听。",
+    pinPlaceholder: "例如 1234",
+    pinSubmit: "进入收听",
+    pinInvalid: "房间口令不正确或已更新，请重新输入",
+    audioErrorPrefix: "无法开启音频播报，请再次点击重试：",
+  },
+  en: {
+    pageTitle: "Live Sermon Interpretation",
+    headerTitle: "Live Sermon Interpretation",
+    langToggleText: "中文",
+    statusLive: "LIVE",
+    statusPaused: "PAUSED",
+    statusStandby: "STANDBY",
+    statusConnecting: "CONNECTING",
+    subConnecting: "Connecting to church live channel...",
+    subStandby: "Connected · Waiting for the sermon to begin",
+    subLiveFallback: "Live audio interpretation active",
+    subPausedFallback: "Paused for worship / prayer",
+    dirZhEn: "Mandarin → American English",
+    dirEnZh: "English → Mandarin Chinese",
+    pauseNotice: "Paused for worship or prayer — live interpretation will resume automatically.",
+    unlockTitle: "Tap to Start Live Audio",
+    unlockSub: "Please wear headphones · Tap screen to resume if paused after sleep",
+    resumeTitle: "Tap to Resume Live Audio",
+    resumeSub: "Screen unlocked — tap anywhere to reconnect audio playback",
+    placeholderMain: "Connected to Church Live Channel",
+    placeholderSub: "Live voice interpretation and captions will appear automatically when the speaker begins.",
+    speakingBadge: "Live",
+    jumpLatest: "↓ Jump to Latest",
+    dockEnableAudio: "Listen",
+    dockAudioLive: "Listening",
+    dockAudioMuted: "Muted",
+    dockResumeAudio: "Resume",
+    dockShowSource: "Source",
+    dockHideSource: "Hide Src",
+    pinTitle: "Enter Room PIN",
+    pinDesc: "Enter the room PIN shown on the church screen or soundbooth to join.",
+    pinPlaceholder: "e.g. 1234",
+    pinSubmit: "Join Live Audio",
+    pinInvalid: "Incorrect or updated room PIN. Please try again.",
+    audioErrorPrefix: "Unable to start audio playback, please tap again: ",
+  },
+};
 
 const el = {
   statusDot: document.getElementById("statusDot"),
+  headerTitle: document.getElementById("headerTitle"),
   directionSubtitle: document.getElementById("directionSubtitle"),
   statusBadge: document.getElementById("statusBadge"),
+  langToggleBtn: document.getElementById("langToggleBtn"),
   themeBtn: document.getElementById("themeBtn"),
 
   pinGate: document.getElementById("pinGate"),
+  pinTitle: document.getElementById("pinTitle"),
+  pinDesc: document.getElementById("pinDesc"),
   pinForm: document.getElementById("pinForm"),
   pinInput: document.getElementById("pinInput"),
+  pinSubmitBtn: document.getElementById("pinSubmitBtn"),
   pinError: document.getElementById("pinError"),
 
   audioPrompt: document.getElementById("audioPrompt"),
   unlockAudioBtn: document.getElementById("unlockAudioBtn"),
+  unlockTitle: document.getElementById("unlockTitle"),
+  unlockSub: document.getElementById("unlockSub"),
   noticeBanner: document.getElementById("noticeBanner"),
 
   captionViewport: document.getElementById("captionViewport"),
@@ -37,38 +119,62 @@ const state = {
   ws: null,
   reconnectTimer: null,
   pingTimer: null,
+  pongWatchdogTimer: null,
   reconnectAttempt: 0,
   wakeLock: null,
+
+  uiLang: "zh",
+  uiLangManual: false,
 
   roomPin: "",
   live: false,
   paused: false,
   direction: "zh-en",
-  directionLabel: "",
 
   audioEnabled: false,
   audioMuted: false,
+  needsAudioResume: false,
   showSource: false,
   fontSizeRem: 1.32,
   autoScroll: true,
 
   speakingTurnId: null,
+  lastServerTurnId: null,
   entriesByTurn: new Map(),
   turnOrder: [],
 };
 
+function t(key) {
+  return (I18N[state.uiLang] || I18N.zh)[key] || I18N.zh[key] || key;
+}
+
 const player = new Pcm24kPlayer({
-  lookaheadSeconds: 0.08,
-  maxBufferSeconds: 1.4,
+  lookaheadSeconds: 0.22,
+  maxBufferSeconds: 2.2,
+  turnClearHoldMs: 950,
+  enableKeepAlive: true,
   onActiveTurnChange: (turnId) => {
-    if (state.audioEnabled && !state.audioMuted) {
+    if (state.audioEnabled && !state.audioMuted && !state.needsAudioResume) {
       setSpeakingTurn(turnId);
     }
   },
   onAudioLevel: (rms) => {
-    if (!state.audioEnabled || state.audioMuted) return;
-    const scale = 1 + Math.min(0.7, rms * 4.5);
+    if (!state.audioEnabled || state.audioMuted || state.needsAudioResume) return;
+    const scale = 1 + Math.min(0.65, rms * 4.2);
     el.audioIndicator.style.transform = `scale(${scale.toFixed(2)})`;
+  },
+  onStateChange: (ctxState) => {
+    if (!state.audioEnabled || state.audioMuted) return;
+    if (ctxState === "running") {
+      state.needsAudioResume = false;
+      el.audioPrompt.classList.add("hidden");
+      updateAudioDockUI();
+    } else if (ctxState === "suspended" || ctxState === "interrupted") {
+      // iOS Safari puts AudioContext in "interrupted" or "suspended" after lock screen
+      state.needsAudioResume = true;
+      updateAudioPromptUI();
+      updateAudioDockUI();
+    }
   },
 });
 
@@ -86,6 +192,8 @@ function savePrefs() {
       PREFS_KEY,
       JSON.stringify({
         theme: document.documentElement.dataset.theme || "dark",
+        uiLang: state.uiLang,
+        uiLangManual: state.uiLangManual,
         showSource: state.showSource,
         fontSizeRem: state.fontSizeRem,
         volume: Number(el.volumeRange.value),
@@ -93,6 +201,45 @@ function savePrefs() {
     );
   } catch {
     // Ignore
+  }
+}
+
+function applyUiLanguage(lang, isManual = false) {
+  state.uiLang = lang === "en" ? "en" : "zh";
+  if (isManual) {
+    state.uiLangManual = true;
+  }
+  document.documentElement.lang = state.uiLang === "en" ? "en" : "zh-CN";
+  document.title = t("pageTitle");
+  el.headerTitle.textContent = t("headerTitle");
+  el.langToggleBtn.textContent = t("langToggleText");
+  el.pinTitle.textContent = t("pinTitle");
+  el.pinDesc.textContent = t("pinDesc");
+  el.pinInput.placeholder = t("pinPlaceholder");
+  el.pinSubmitBtn.textContent = t("pinSubmit");
+  el.placeholderMain.textContent = t("placeholderMain");
+  el.placeholderSub.textContent = t("placeholderSub");
+  el.jumpLatestBtn.textContent = t("jumpLatest");
+
+  // Update existing speaking badges on rendered captions
+  for (const entry of state.entriesByTurn.values()) {
+    if (entry.badgeTextEl) {
+      entry.badgeTextEl.textContent = t("speakingBadge");
+    }
+  }
+
+  applyShowSource(state.showSource);
+  updateAudioPromptUI();
+  updateAudioDockUI();
+  updateSessionStatusUI();
+}
+
+function maybeAutoSelectUiLanguageForDirection(direction) {
+  if (state.uiLangManual) return;
+  // Listeners of Mandarin -> English are typically English speakers; English -> Mandarin are Chinese speakers
+  const autoLang = direction === "zh-en" ? "en" : "zh";
+  if (autoLang !== state.uiLang) {
+    applyUiLanguage(autoLang, false);
   }
 }
 
@@ -105,7 +252,7 @@ function applyShowSource(show) {
   state.showSource = Boolean(show);
   el.captionViewport.classList.toggle("hide-source", !state.showSource);
   el.sourceToggleBtn.setAttribute("aria-pressed", String(state.showSource));
-  el.sourceToggleBtn.textContent = state.showSource ? "隐原文" : "原文";
+  el.sourceToggleBtn.textContent = state.showSource ? t("dockHideSource") : t("dockShowSource");
 }
 
 function applyFontSize(rem) {
@@ -122,32 +269,51 @@ function showNotice(text, kind = "warning") {
   el.noticeBanner.className = `notice-banner${kind === "info" ? " info" : ""}`;
 }
 
+function updateAudioPromptUI() {
+  if (!state.audioEnabled) {
+    el.unlockTitle.textContent = t("unlockTitle");
+    el.unlockSub.textContent = t("unlockSub");
+    el.audioPrompt.classList.remove("hidden");
+  } else if (state.needsAudioResume && !state.audioMuted) {
+    el.unlockTitle.textContent = t("resumeTitle");
+    el.unlockSub.textContent = t("resumeSub");
+    el.audioPrompt.classList.remove("hidden");
+  } else {
+    el.audioPrompt.classList.add("hidden");
+  }
+}
+
+function directionDisplayLabel() {
+  if (state.direction === "en-zh") return t("dirEnZh");
+  return t("dirZhEn");
+}
+
 function updateSessionStatusUI() {
   el.statusDot.className = "status-dot";
   el.statusBadge.className = "status-badge";
 
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
     el.statusDot.classList.add("reconnecting");
-    el.statusBadge.textContent = "连接中";
-    el.directionSubtitle.textContent = "正在连接教会同传频道...";
+    el.statusBadge.textContent = t("statusConnecting");
+    el.directionSubtitle.textContent = t("subConnecting");
     return;
   }
 
   if (state.live && state.paused) {
     el.statusDot.classList.add("paused");
     el.statusBadge.classList.add("paused");
-    el.statusBadge.textContent = "暂停中";
-    el.directionSubtitle.textContent = state.directionLabel || "唱诗 / 祷告暂停";
-    showNotice("当前为唱诗/祷告暂停时间，讲道恢复后将自动继续播报 · Paused for worship/prayer");
+    el.statusBadge.textContent = t("statusPaused");
+    el.directionSubtitle.textContent = directionDisplayLabel() || t("subPausedFallback");
+    showNotice(t("pauseNotice"));
   } else if (state.live) {
     el.statusDot.classList.add("live");
     el.statusBadge.classList.add("live");
-    el.statusBadge.textContent = "直播中";
-    el.directionSubtitle.textContent = state.directionLabel || "实时同声传译广播中";
+    el.statusBadge.textContent = t("statusLive");
+    el.directionSubtitle.textContent = directionDisplayLabel() || t("subLiveFallback");
     showNotice("");
   } else {
-    el.statusBadge.textContent = "待机";
-    el.directionSubtitle.textContent = "已连接 · 等待讲员开始发言";
+    el.statusBadge.textContent = t("statusStandby");
+    el.directionSubtitle.textContent = t("subStandby");
     showNotice("");
   }
 }
@@ -160,45 +326,122 @@ async function requestWakeLock() {
       state.wakeLock = null;
     });
   } catch {
-    // Wake Lock may be unsupported or blocked in low-power mode
+    // Wake Lock optional
+  }
+}
+
+function registerMediaSessionHandlers() {
+  if (!("mediaSession" in navigator)) return;
+  try {
+    navigator.mediaSession.setActionHandler("play", () => {
+      if (state.audioEnabled) {
+        state.audioMuted = false;
+        player.setMuted(false);
+        player.resumeIfNeeded();
+        updateAudioDockUI();
+      }
+    });
+    navigator.mediaSession.setActionHandler("pause", () => {
+      if (state.audioEnabled) {
+        state.audioMuted = true;
+        player.setMuted(true);
+        player.clearQueue();
+        updateAudioDockUI();
+      }
+    });
+  } catch {
+    // Ignore unsupported actions
   }
 }
 
 async function enableAudioFromUserGesture() {
   try {
-    await player.ensureReady();
-    // Unlock iOS Safari Web Audio cleanly with a tiny silent buffer inside user gesture
-    if (player.ctx) {
-      const silent = player.ctx.createBuffer(1, 1, player.sampleRate);
-      const src = player.ctx.createBufferSource();
-      src.buffer = silent;
-      src.connect(player.ctx.destination);
-      src.start(0);
-    }
+    const running = await player.ensureReady();
     player.setVolume(Number(el.volumeRange.value));
     player.setMuted(false);
     state.audioEnabled = true;
     state.audioMuted = false;
-    el.audioPrompt.classList.add("hidden");
+    state.needsAudioResume = !running;
+    updateAudioPromptUI();
     updateAudioDockUI();
+    registerMediaSessionHandlers();
     requestWakeLock();
+    if (running && state.lastServerTurnId && state.speakingTurnId === null) {
+      setSpeakingTurn(state.lastServerTurnId);
+    }
   } catch (err) {
-    showNotice(`无法开启音频播报，请再次点击重试：${err.message}`);
+    showNotice(`${t("audioErrorPrefix")}${err.message}`);
   }
 }
 
+async function recoverAfterWake() {
+  if (state.audioEnabled) {
+    requestWakeLock();
+  }
+
+  // 1. Resume AudioContext (handles both "suspended" AND iOS Safari "interrupted")
+  if (state.audioEnabled && !state.audioMuted) {
+    const ok = await player.resumeIfNeeded();
+    state.needsAudioResume = !ok;
+    updateAudioPromptUI();
+    updateAudioDockUI();
+    if (!ok) {
+      attachOneShotTapResume();
+    }
+  }
+
+  // 2. Verify WebSocket is genuinely alive (iOS sleep leaves zombie OPEN sockets!)
+  if (!state.ws || state.ws.readyState === WebSocket.CLOSED || state.ws.readyState === WebSocket.CLOSING) {
+    connectListenerWs();
+    return;
+  }
+
+  if (state.ws.readyState === WebSocket.OPEN) {
+    clearTimeout(state.pongWatchdogTimer);
+    try {
+      state.ws.send(JSON.stringify({ type: "ping" }));
+    } catch {
+      connectListenerWs();
+      return;
+    }
+    state.pongWatchdogTimer = setTimeout(() => {
+      // No pong within 3s after screen wake -> zombie TCP socket, force clean reconnect!
+      connectListenerWs();
+    }, 3000);
+  }
+}
+
+let _tapResumeBound = false;
+function attachOneShotTapResume() {
+  if (_tapResumeBound) return;
+  _tapResumeBound = true;
+  const onAnyTap = async () => {
+    _tapResumeBound = false;
+    document.removeEventListener("pointerdown", onAnyTap, true);
+    document.removeEventListener("touchstart", onAnyTap, true);
+    if (state.audioEnabled && !state.audioMuted && state.needsAudioResume) {
+      await enableAudioFromUserGesture();
+    }
+  };
+  document.addEventListener("pointerdown", onAnyTap, { capture: true, once: true });
+  document.addEventListener("touchstart", onAnyTap, { capture: true, once: true });
+}
+
 function updateAudioDockUI() {
-  const active = state.audioEnabled && !state.audioMuted;
+  const active = state.audioEnabled && !state.audioMuted && !state.needsAudioResume;
   el.audioToggleBtn.classList.toggle("active", active);
   el.audioToggleBtn.setAttribute("aria-pressed", String(active));
   if (!state.audioEnabled) {
-    el.audioToggleLabel.textContent = "开启语音";
+    el.audioToggleLabel.textContent = t("dockEnableAudio");
     el.audioIndicator.style.transform = "scale(1)";
   } else if (state.audioMuted) {
-    el.audioToggleLabel.textContent = "已静音";
+    el.audioToggleLabel.textContent = t("dockAudioMuted");
+    el.audioIndicator.style.transform = "scale(1)";
+  } else if (state.needsAudioResume) {
+    el.audioToggleLabel.textContent = t("dockResumeAudio");
     el.audioIndicator.style.transform = "scale(1)";
   } else {
-    el.audioToggleLabel.textContent = "语音中";
+    el.audioToggleLabel.textContent = t("dockAudioLive");
   }
 }
 
@@ -225,6 +468,7 @@ function refreshLatestHighlight() {
 }
 
 function setSpeakingTurn(turnId) {
+  if (state.speakingTurnId === turnId) return;
   state.speakingTurnId = turnId;
   for (const [tid, entry] of state.entriesByTurn.entries()) {
     entry.node.classList.toggle("speaking", turnId !== null && tid === turnId);
@@ -252,8 +496,14 @@ function getOrCreateEntry(turnId, timeLabel = null) {
 
   const badge = document.createElement("span");
   badge.className = "speaking-pill";
-  badge.innerHTML =
-    '<span class="eq-bars" aria-hidden="true"><span></span><span></span><span></span></span><span>播报中</span>';
+  const eq = document.createElement("span");
+  eq.className = "eq-bars";
+  eq.setAttribute("aria-hidden", "true");
+  eq.innerHTML = "<span></span><span></span><span></span>";
+  const badgeTextEl = document.createElement("span");
+  badgeTextEl.textContent = t("speakingBadge");
+  badge.appendChild(eq);
+  badge.appendChild(badgeTextEl);
 
   meta.appendChild(timeEl);
   meta.appendChild(badge);
@@ -278,6 +528,7 @@ function getOrCreateEntry(turnId, timeLabel = null) {
   const entry = {
     turnId: tid,
     node,
+    badgeTextEl,
     confirmedSpan,
     stashSpan,
     sourceEl,
@@ -289,7 +540,6 @@ function getOrCreateEntry(turnId, timeLabel = null) {
   state.entriesByTurn.set(tid, entry);
   state.turnOrder.push(tid);
 
-  // Keep DOM lean on long 60-minute sermons (cap at 120 turns)
   while (state.turnOrder.length > 120) {
     const oldestId = state.turnOrder.shift();
     const oldEntry = state.entriesByTurn.get(oldestId);
@@ -316,6 +566,7 @@ function clearCaptions() {
   state.entriesByTurn.clear();
   state.turnOrder = [];
   state.speakingTurnId = null;
+  state.lastServerTurnId = null;
   el.captionViewport.innerHTML = "";
   el.captionViewport.appendChild(el.emptyPlaceholder);
   el.emptyPlaceholder.classList.remove("hidden");
@@ -340,8 +591,13 @@ function hydrateHistory(historyItems) {
 function handleServerMessage(msg) {
   if (!msg || !msg.type) return;
 
+  if (msg.type === "pong") {
+    clearTimeout(state.pongWatchdogTimer);
+    return;
+  }
+
   if (msg.type === "auth_required") {
-    showPinGate(msg.message || "口令不正确，请重新输入");
+    showPinGate(t("pinInvalid"));
     return;
   }
 
@@ -350,10 +606,11 @@ function handleServerMessage(msg) {
     state.live = Boolean(msg.live);
     state.paused = Boolean(msg.paused);
     state.direction = msg.direction || "zh-en";
-    state.directionLabel = msg.direction_label || "";
+    maybeAutoSelectUiLanguageForDirection(state.direction);
     hydrateHistory(msg.history);
     if (msg.active_turn_id) {
-      setSpeakingTurn(Number(msg.active_turn_id));
+      state.lastServerTurnId = Number(msg.active_turn_id);
+      setSpeakingTurn(state.lastServerTurnId);
     }
     updateSessionStatusUI();
     return;
@@ -364,7 +621,7 @@ function handleServerMessage(msg) {
     state.live = Boolean(msg.live);
     state.paused = Boolean(msg.paused);
     state.direction = msg.direction || state.direction;
-    state.directionLabel = msg.direction_label || state.directionLabel;
+    maybeAutoSelectUiLanguageForDirection(state.direction);
     if (!wasLive && state.live) {
       clearCaptions();
     }
@@ -419,9 +676,13 @@ function handleServerMessage(msg) {
   }
 
   if (msg.type === "active_turn" || msg.type === "audio_turn") {
-    // When muted/reading captions only, follow server active_turn directly
-    if (!state.audioEnabled || state.audioMuted) {
-      setSpeakingTurn(msg.turn_id !== null && msg.turn_id !== undefined ? Number(msg.turn_id) : null);
+    const tid = msg.turn_id !== null && msg.turn_id !== undefined ? Number(msg.turn_id) : null;
+    if (tid !== null) {
+      state.lastServerTurnId = tid;
+    }
+    // When muted/reading-only OR waiting for audio resume, follow server active_turn directly
+    if (!state.audioEnabled || state.audioMuted || state.needsAudioResume) {
+      setSpeakingTurn(tid);
     }
     return;
   }
@@ -435,15 +696,30 @@ function handleBinaryAudio(arrayBuffer) {
   if (!state.audioEnabled || state.audioMuted) return;
   if (!arrayBuffer || arrayBuffer.byteLength < 6) return;
 
+  // If iOS suspended/interrupted AudioContext while locked, prompt clean one-tap resume
+  if (!player.isRunning()) {
+    player.resumeIfNeeded().then((ok) => {
+      if (!ok) {
+        state.needsAudioResume = true;
+        updateAudioPromptUI();
+        updateAudioDockUI();
+        attachOneShotTapResume();
+      }
+    });
+    return;
+  }
+
   const view = new DataView(arrayBuffer);
   const codec = view.getUint8(0);
   const turnId = view.getUint32(1, true) || null;
-  const payload = new Uint8Array(arrayBuffer, 5);
+  if (turnId) {
+    state.lastServerTurnId = turnId;
+  }
 
-  if (codec === 2) {
-    player.enqueueUlaw24k(payload, turnId);
-  } else if (codec === 1) {
+  if (codec === 1) {
     player.enqueuePcm16(arrayBuffer.slice(5), turnId);
+  } else if (codec === 2) {
+    player.enqueueUlaw24k(new Uint8Array(arrayBuffer, 5), turnId);
   }
 }
 
@@ -475,6 +751,7 @@ function scheduleReconnect() {
 function connectListenerWs() {
   clearTimeout(state.reconnectTimer);
   clearInterval(state.pingTimer);
+  clearTimeout(state.pongWatchdogTimer);
 
   if (state.ws) {
     try {
@@ -500,7 +777,7 @@ function connectListenerWs() {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "ping" }));
       }
-    }, 20000);
+    }, 15000);
   };
 
   ws.onmessage = (event) => {
@@ -518,26 +795,31 @@ function connectListenerWs() {
 
   ws.onclose = (event) => {
     clearInterval(state.pingTimer);
+    clearTimeout(state.pongWatchdogTimer);
     if (state.ws === ws) {
       state.ws = null;
     }
     updateSessionStatusUI();
     if (event.code === 4401) {
       sessionStorage.removeItem(PIN_SESSION_KEY);
-      showPinGate("房间口令不正确或已更新，请重新输入");
+      showPinGate(t("pinInvalid"));
       return;
     }
     scheduleReconnect();
   };
 
   ws.onerror = () => {
-    // onclose will trigger reconnect cleanly
+    // onclose will handle reconnect
   };
 }
 
 async function init() {
   const prefs = loadPrefs();
   applyTheme(prefs.theme || "dark");
+  state.uiLangManual = Boolean(prefs.uiLangManual);
+  const initialLang =
+    prefs.uiLang || ((navigator.language || "").toLowerCase().startsWith("en") ? "en" : "zh");
+  applyUiLanguage(initialLang, state.uiLangManual);
   applyShowSource(Boolean(prefs.showSource));
   applyFontSize(prefs.fontSizeRem || 1.32);
   if (prefs.volume !== undefined) {
@@ -545,7 +827,13 @@ async function init() {
     player.setVolume(Number(prefs.volume));
   }
 
-  // Bind UI controls
+  // Language switcher (Chinese <-> English)
+  el.langToggleBtn.addEventListener("click", () => {
+    const next = state.uiLang === "zh" ? "en" : "zh";
+    applyUiLanguage(next, true);
+    savePrefs();
+  });
+
   el.themeBtn.addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
     applyTheme(next);
@@ -555,7 +843,7 @@ async function init() {
   el.unlockAudioBtn.addEventListener("click", enableAudioFromUserGesture);
 
   el.audioToggleBtn.addEventListener("click", async () => {
-    if (!state.audioEnabled) {
+    if (!state.audioEnabled || state.needsAudioResume) {
       await enableAudioFromUserGesture();
       return;
     }
@@ -563,7 +851,10 @@ async function init() {
     player.setMuted(state.audioMuted);
     if (state.audioMuted) {
       player.clearQueue();
+    } else {
+      await player.resumeIfNeeded();
     }
+    updateAudioPromptUI();
     updateAudioDockUI();
   });
 
@@ -577,6 +868,7 @@ async function init() {
     } else if (v > 0 && state.audioMuted && state.audioEnabled) {
       state.audioMuted = false;
       player.setMuted(false);
+      player.resumeIfNeeded();
       updateAudioDockUI();
     }
     savePrefs();
@@ -619,24 +911,21 @@ async function init() {
     if (!entered) return;
     state.roomPin = entered;
     sessionStorage.setItem(PIN_SESSION_KEY, entered);
-    // Unlock audio in the same user gesture so phone plays immediately after PIN verification!
     await enableAudioFromUserGesture();
     connectListenerWs();
   });
 
-  // Auto-resume AudioContext, WakeLock & WebSocket when returning from phone lock screen
+  // Robust mobile screen-lock & app-switch recovery
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
-      if (state.audioEnabled && player.ctx && player.ctx.state === "suspended") {
-        player.ctx.resume().catch(() => {});
-      }
-      if (state.audioEnabled) {
-        requestWakeLock();
-      }
-      if (!state.ws || state.ws.readyState === WebSocket.CLOSED) {
-        connectListenerWs();
-      }
+      recoverAfterWake();
     }
+  });
+  window.addEventListener("pageshow", () => {
+    recoverAfterWake();
+  });
+  window.addEventListener("focus", () => {
+    recoverAfterWake();
   });
 
   // Check URL query ?pin=... or saved sessionStorage PIN, then probe broadcast status
@@ -647,6 +936,10 @@ async function init() {
     const res = await fetch("/api/broadcast/status");
     if (res.ok) {
       const status = await res.json();
+      if (status.direction) {
+        state.direction = status.direction;
+        maybeAutoSelectUiLanguageForDirection(status.direction);
+      }
       if (status.requires_pin && !state.roomPin) {
         showPinGate();
         return;

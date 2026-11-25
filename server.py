@@ -821,7 +821,9 @@ class BroadcastHub:
     - Keeps a rolling ring buffer of recent captions so late-joining phones immediately catch up.
     """
 
+    AUDIO_CODEC_PCM16_24K = 1
     AUDIO_CODEC_ULAW_24K = 2
+    PCM_LOSSLESS_MAX_LISTENERS = 25
 
     def __init__(self) -> None:
         self._soundbooth: dict[WebSocket, bool] = {}  # ws -> wants_raw_audio
@@ -1055,12 +1057,26 @@ class BroadcastHub:
         for ws in stale:
             self._soundbooth.pop(ws, None)
 
-        # 2. Congregation mobile listeners (encoded once to 24kHz G.711 μ-law with 5-byte header)
-        if self._listeners:
+        # 2. Congregation mobile listeners:
+        #    - <= 25 listeners: lossless 24kHz Int16 PCM (codec 1) for 100% timbre parity with soundbooth
+        #    - > 25 listeners: 24kHz G.711 μ-law (codec 2, 2x smaller) to protect church Wi-Fi bandwidth
+        listener_count = len(self._listeners)
+        if listener_count > 0:
             effective_turn = turn_id if turn_id is not None else (self.active_turn_id or 0)
-            ulaw_payload = pcm16_to_ulaw(pcm_bytes)
-            if ulaw_payload:
-                frame = struct.pack("<BI", self.AUDIO_CODEC_ULAW_24K, max(0, int(effective_turn))) + ulaw_payload
+            usable = len(pcm_bytes) & ~1
+            if usable > 0:
+                clean_pcm = pcm_bytes[:usable]
+                if listener_count <= self.PCM_LOSSLESS_MAX_LISTENERS:
+                    frame = (
+                        struct.pack("<BI", self.AUDIO_CODEC_PCM16_24K, max(0, int(effective_turn)))
+                        + clean_pcm
+                    )
+                else:
+                    ulaw_payload = pcm16_to_ulaw(clean_pcm)
+                    frame = (
+                        struct.pack("<BI", self.AUDIO_CODEC_ULAW_24K, max(0, int(effective_turn)))
+                        + ulaw_payload
+                    )
                 for q in list(self._listeners.values()):
                     self._enqueue_listener(q, ("bytes", frame))
 
