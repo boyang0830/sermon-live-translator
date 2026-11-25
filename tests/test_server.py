@@ -494,3 +494,29 @@ def test_mode2_1_to_n_fanout_ulaw_audio_late_join_and_pin(tmp_path, monkeypatch)
     r_reset = client.post("/api/broadcast/settings", json={"room_pin": "", "public_url": ""})
     assert r_reset.status_code == 200
     assert r_reset.json()["requires_pin"] is False
+
+
+def test_cloudflared_tunnel_manager_start_and_stop(tmp_path, monkeypatch):
+    fake_bin = tmp_path / "cloudflared"
+    fake_bin.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'INF |  https://grace-church-test.trycloudflare.com  |' >&2\n"
+        "sleep 30\n",
+        encoding="utf-8",
+    )
+    fake_bin.chmod(0o755)
+    monkeypatch.setattr(server.tunnel_manager, "find_binary", lambda: str(fake_bin))
+
+    client = TestClient(server.app)
+    r_start = client.post("/api/broadcast/tunnel/start")
+    assert r_start.status_code == 200
+    data = r_start.json()
+    assert data["tunnel_running"] is True
+    assert data["tunnel_url"] == "https://grace-church-test.trycloudflare.com"
+    assert data["effective_listen_url"] == "https://grace-church-test.trycloudflare.com/listen"
+
+    r_stop = client.post("/api/broadcast/tunnel/stop")
+    assert r_stop.status_code == 200
+    stopped = r_stop.json()
+    assert stopped["tunnel_running"] is False
+    assert stopped["tunnel_url"] == ""

@@ -1172,11 +1172,14 @@ class CloudflaredTunnelManager:
                 except Exception:
                     return
 
-            t_err = asyncio.create_task(drain(proc.stderr))
-            t_out = asyncio.create_task(drain(proc.stdout))
-            self._drain_task = asyncio.create_task(
-                asyncio.gather(t_err, t_out, return_exceptions=True)  # type: ignore[arg-type]
-            )
+            async def drain_all() -> None:
+                await asyncio.gather(
+                    drain(proc.stderr),
+                    drain(proc.stdout),
+                    return_exceptions=True,
+                )
+
+            self._drain_task = asyncio.create_task(drain_all())
 
             try:
                 await asyncio.wait_for(found_event.wait(), timeout=timeout)
@@ -2784,8 +2787,9 @@ async def api_broadcast_tunnel_start(request: Request) -> JSONResponse:
     req_port = request.url.port or int(os.getenv("PORT", "8765"))
     try:
         await tunnel_manager.start(port=req_port)
-    except RuntimeError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+    except Exception as exc:
+        logger.exception("Failed to start Cloudflare 5G tunnel: %s", exc)
+        return JSONResponse({"error": f"启动 5G 公网隧道失败：{exc}"}, status_code=500)
     return JSONResponse(
         broadcast_hub.build_status_snapshot(include_admin=True, port=req_port)
     )
