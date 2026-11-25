@@ -24,6 +24,7 @@ export class QwenWebRtcClient {
     this.localAnalyser = null;
     this.remoteAnalyserCtx = null;
     this.remoteAnalyser = null;
+    this.remoteBroadcastNode = null;
     this._meterRaf = null;
 
     this.running = false;
@@ -490,14 +491,50 @@ export class QwenWebRtcClient {
     this._meterRaf = requestAnimationFrame(tick);
   }
 
-  _attachRemoteAudioMonitor(stream) {
+  async _attachRemoteAudioMonitor(stream) {
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       this.remoteAnalyserCtx = new AudioCtx();
+      if (this.remoteAnalyserCtx.state === "suspended") {
+        await this.remoteAnalyserCtx.resume().catch(() => {});
+      }
       const src = this.remoteAnalyserCtx.createMediaStreamSource(stream);
       this.remoteAnalyser = this.remoteAnalyserCtx.createAnalyser();
       this.remoteAnalyser.fftSize = 512;
       src.connect(this.remoteAnalyser);
+
+      // Mode 2 broadcast tap: capture clean 24kHz Int16 PCM from WebRTC remote audio
+      // so the single Qwen WebRTC stream can be fanned out to N congregation phones.
+      if (typeof this.cb.onRemotePcm === "function" && this.remoteAnalyserCtx.audioWorklet) {
+        try {
+          await this.remoteAnalyserCtx.audioWorklet.addModule("/static/audio-capture-worklet.js");
+          if (!this.running || !this.remoteAnalyserCtx) return;
+          const worklet = new AudioWorkletNode(this.remoteAnalyserCtx, "pcm-16k-capture", {
+            processorOptions: { targetRate: 24000 },
+          });
+          let silentChunks = 0;
+          worklet.port.onmessage = (event) => {
+            if (!this.running) return;
+            const { pcm, rms } = event.data || {};
+            if (!pcm) return;
+            // Gate pure dead-silence after 600ms tail to save church Wi-Fi bandwidth
+            if (rms > 0.002) {
+              silentChunks = 0;
+            } else {
+              silentChunks++;
+              if (silentChunks > 6) return;
+            }
+            const activeTurn =
+              this.speakingTurnId ||
+              (this.turnHasOutput ? this.turnId : Math.max(1, this.turnId - 1));
+            this.cb.onRemotePcm?.(pcm, activeTurn);
+          };
+          src.connect(worklet);
+          this.remoteBroadcastNode = worklet;
+        } catch (err) {
+          console.warn("Unable to attach Mode 2 WebRTC broadcast audio tap:", err);
+        }
+      }
     } catch (err) {
       console.warn("Unable to attach remote audio analyser:", err);
     }
@@ -646,6 +683,15 @@ export class QwenWebRtcClient {
       await this.localAnalyserCtx.close().catch(() => {});
       this.localAnalyserCtx = null;
       this.localAnalyser = null;
+    }
+    if (this.remoteBroadcastNode) {
+      try {
+        this.remoteBroadcastNode.port.onmessage = null;
+        this.remoteBroadcastNode.disconnect();
+      } catch {
+        // Ignore
+      }
+      this.remoteBroadcastNode = null;
     }
     if (this.remoteAnalyserCtx) {
       await this.remoteAnalyserCtx.close().catch(() => {});

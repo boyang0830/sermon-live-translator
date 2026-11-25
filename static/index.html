@@ -12,12 +12,16 @@
       <div class="brand-dot" id="liveDot" aria-hidden="true"></div>
       <div>
         <h1>教会主日同声传译台</h1>
-        <p class="subtitle" id="headerSubtitle">Mandarin → American English · Qwen3.8-LiveTranslate (单机音控版)</p>
+        <p class="subtitle" id="headerSubtitle">Mandarin → American English · Qwen3.8-LiveTranslate (音控台 + 会众广播版)</p>
       </div>
     </div>
 
     <div class="topbar-meta">
       <div class="status-pill" id="statusPill" role="status" aria-live="polite">待机</div>
+      <button type="button" class="metric-chip metric-chip-btn" id="listenerChipBtn" title="点击打开会众手机扫码二维码">
+        <span class="metric-label">🎧 在线听众</span>
+        <span class="metric-value" id="listenerCountDisplay">0</span>
+      </button>
       <div class="metric-chip" title="本次运行时间">
         <span class="metric-label">时长</span>
         <span class="metric-value" id="timerDisplay">00:00</span>
@@ -102,6 +106,68 @@
 
         <!-- Alert / Error Banner -->
         <div class="banner hidden" id="alertBanner" role="alert"></div>
+      </section>
+
+      <!-- Mode 2: Congregation Mobile Broadcast Card -->
+      <section class="card broadcast-card">
+        <div class="card-header">
+          <h2>会众手机广播 · Mode 2</h2>
+          <span class="listener-pill" id="broadcastStatusBadge">🎧 0 人在线</span>
+        </div>
+
+        <div class="broadcast-url-box">
+          <span class="broadcast-url-label" id="broadcastUrlType">局域网 Wi-Fi 收听地址</span>
+          <a href="/listen" target="_blank" rel="noopener" class="broadcast-url-link mono" id="broadcastListenUrl">
+            加载中...
+          </a>
+        </div>
+
+        <div class="broadcast-actions">
+          <button type="button" class="btn btn-primary btn-sm" id="openQrModalBtn">
+            投屏扫码二维码
+          </button>
+          <button type="button" class="btn btn-ghost btn-sm" id="copyListenUrlBtn">
+            复制收听链接
+          </button>
+        </div>
+
+        <details class="broadcast-settings" id="broadcastSettingsDetails">
+          <summary>公网穿透地址（5G 听众）与房间口令设置</summary>
+          <div class="details-body">
+            <div class="field">
+              <label for="publicUrlInput">公网 / Cloudflare Tunnel 地址（可选，留空默认使用教会 Wi-Fi 局域网）</label>
+              <input
+                type="url"
+                id="publicUrlInput"
+                autocomplete="off"
+                placeholder="例：https://sermon.example.com 或 xxx.trycloudflare.com"
+              />
+              <p class="field-help">
+                手机用 5G 时，可在本机另开终端运行 <code>cloudflared tunnel --url http://127.0.0.1:8765</code> 并把生成的网址填到此处；本机音控台受本地白名单保护，外网仅能访问 <code>/listen</code>。
+              </p>
+            </div>
+
+            <div class="field">
+              <label for="roomPinInput">房间访问口令 PIN（可选，默认留空免密扫码直进）</label>
+              <div class="input-action-row">
+                <input
+                  type="text"
+                  id="roomPinInput"
+                  inputmode="numeric"
+                  maxlength="12"
+                  autocomplete="off"
+                  placeholder="留空免密，或填 4–12 位数字/字母"
+                />
+                <button type="button" class="btn btn-sm btn-primary" id="saveBroadcastSettingsBtn">
+                  保存
+                </button>
+              </div>
+              <p class="field-help" id="broadcastSettingsHint">
+                默认免密扫码即听；如需防外部误入可设 4 位数字口令。
+              </p>
+            </div>
+          </div>
+        </details>
       </section>
 
       <section class="card">
@@ -362,6 +428,38 @@
     </div>
     <div class="fullscreen-body" id="fullscreenCaptions" aria-live="polite">
       <p class="fs-placeholder">Waiting for live interpretation...</p>
+    </div>
+  </div>
+
+  <!-- Projector QR Code Modal (Mode 2 Congregation Onboarding) -->
+  <div class="qr-modal hidden" id="qrModal" role="dialog" aria-modal="true" aria-label="会众手机扫码收听二维码">
+    <div class="qr-modal-card">
+      <div class="qr-modal-header">
+        <div>
+          <h2>扫码收听实时同声传译</h2>
+          <p class="qr-modal-sub">Scan with your phone camera · Please wear headphones / 请佩戴耳机收听</p>
+        </div>
+        <button type="button" class="btn btn-sm btn-ghost" id="closeQrModalBtn">关闭 (Esc)</button>
+      </div>
+
+      <div class="qr-modal-body">
+        <div class="qr-frame">
+          <img id="qrCodeImg" alt="会众收听二维码" width="280" height="280" />
+        </div>
+        <div class="qr-meta">
+          <div class="qr-url-display mono" id="qrModalUrl"></div>
+          <div class="qr-pin-badge hidden" id="qrModalPinBadge">
+            房间口令 PIN：<strong class="mono" id="qrModalPinValue"></strong>
+          </div>
+          <div class="qr-stats-row">
+            <span class="listener-pill" id="qrModalListeners">🎧 当前 0 人在线</span>
+            <button type="button" class="btn btn-sm btn-ghost" id="qrCopyBtn">复制链接</button>
+          </div>
+          <p class="qr-tip" id="qrModalTip">
+            仅消耗音控台 1 路同传 API，所有扫码手机共享同一路实时语音与单句聚焦字幕。
+          </p>
+        </div>
+      </div>
     </div>
   </div>
 

@@ -10,24 +10,38 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 import datetime
+import io
 import json
 import logging
 import os
 import re
+import socket
+import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import warnings
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    try:
+        import audioop  # type: ignore[import-not-found]
+    except ImportError:
+        audioop = None  # Python 3.13+ fallback uses pure-Python μ-law encoder
+
 import httpx
+import segno
 import websockets
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -693,41 +707,374 @@ def build_live_config(
     return types.LiveConnectConfig(**kwargs)
 
 
+_PROXY_FORWARD_HEADERS = (
+    "x-forwarded-for",
+    "cf-connecting-ip",
+    "x-real-ip",
+    "forwarded",
+    "true-client-ip",
+)
+
+# Precomputed pure-Python fallback μ-law encoder (only used on Python 3.13+ without audioop)
+_ULAW_BIAS = 0x84
+_ULAW_CLIP = 32635
+
+
+def _pcm16_sample_to_ulaw(sample: int) -> int:
+    sign = (sample >> 8) & 0x80
+    if sign:
+        sample = -sample
+    if sample > _ULAW_CLIP:
+        sample = _ULAW_CLIP
+    sample += _ULAW_BIAS
+    exponent = 7
+    exp_mask = 0x4000
+    while exponent > 0 and not (sample & exp_mask):
+        exponent -= 1
+        exp_mask >>= 1
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    return (~(sign | (exponent << 4) | mantissa)) & 0xFF
+
+
+def pcm16_to_ulaw(pcm_bytes: bytes) -> bytes:
+    """Encode 16-bit signed LE PCM into 8-bit G.711 μ-law (2x bandwidth reduction, stateless)."""
+    if not pcm_bytes:
+        return b""
+    # Trim odd trailing byte defensively
+    usable = len(pcm_bytes) & ~1
+    if usable <= 0:
+        return b""
+    chunk = pcm_bytes[:usable]
+    if audioop is not None:
+        return audioop.lin2ulaw(chunk, 2)
+    samples = struct.unpack(f"<{usable // 2}h", chunk)
+    return bytes(_pcm16_sample_to_ulaw(s) for s in samples)
+
+
+def detect_lan_ip() -> str:
+    """Detect the primary local-network IPv4 address for church Wi-Fi QR codes."""
+    for target in (("10.255.255.255", 1), ("8.8.8.8", 80)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(target)
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    return "127.0.0.1"
+
+
+def normalize_listen_url(base_or_url: str) -> str:
+    """Normalize a user-provided public base URL (e.g. Cloudflare Tunnel) into a /listen URL."""
+    raw = (base_or_url or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    raw = raw.rstrip("/")
+    if raw.endswith("/listen"):
+        return raw
+    return f"{raw}/listen"
+
+
+def is_local_admin_request(conn: Request | WebSocket) -> bool:
+    """
+    Return True ONLY when the request originates directly from localhost (soundbooth machine)
+    and was NOT proxied through Cloudflare Tunnel or a reverse proxy.
+    """
+    client = getattr(conn, "client", None)
+    host = (client.host if client else "") or ""
+    if host not in ("127.0.0.1", "::1", "localhost", "testclient"):
+        return False
+    headers = conn.headers
+    for hdr in _PROXY_FORWARD_HEADERS:
+        if headers.get(hdr):
+            return False
+    return True
+
+
+_LISTENER_PUBLIC_EVENT_TYPES = frozenset(
+    {
+        "output_transcript",
+        "output_transcript_replace",
+        "input_transcript",
+        "input_transcript_replace",
+        "audio_turn",
+        "active_turn",
+        "turn_complete",
+        "interrupted",
+        "session_state",
+        "listener_count",
+    }
+)
+
+
 class BroadcastHub:
     """
-    Lightweight fan-out hub for translated audio and captions.
-    Serves the local soundbooth client (Mode 1) and is ready for Mode 2 multi-listener fan-out.
+    Unified 1-to-N fan-out hub for translated audio and live captions.
+    - Soundbooth sockets (ws_translate / ws_broadcast) receive full control & metrics events.
+    - Congregation mobile listeners (/ws/listen) each get a non-blocking bounded queue so a
+      single slow phone on church Wi-Fi can NEVER stall other listeners or the soundbooth.
+    - Keeps a rolling ring buffer of recent captions so late-joining phones immediately catch up.
     """
 
-    def __init__(self) -> None:
-        self._listeners: set[WebSocket] = set()
+    AUDIO_CODEC_ULAW_24K = 2
 
-    def register(self, ws: WebSocket) -> None:
-        self._listeners.add(ws)
+    def __init__(self) -> None:
+        self._soundbooth: dict[WebSocket, bool] = {}  # ws -> wants_raw_audio
+        self._listeners: dict[WebSocket, asyncio.Queue[tuple[str, Any]]] = {}
+
+        self.live: bool = False
+        self.paused: bool = False
+        self.model: str = DEFAULT_MODEL_ID
+        self.direction: str = "zh-en"
+        self.transport: str = "webrtc"
+        self.active_turn_id: int | None = None
+        self.active_source_ws: WebSocket | None = None
+
+        self.room_pin: str = os.getenv("LISTENER_PIN", "").strip()
+        self.public_url: str = os.getenv("PUBLIC_BASE_URL", "").strip()
+
+        self._history: deque[dict[str, Any]] = deque(maxlen=30)
+        self._history_by_turn: dict[int, dict[str, Any]] = {}
+
+    @property
+    def listener_count(self) -> int:
+        return len(self._listeners)
+
+    def register(self, ws: WebSocket, wants_audio: bool = True) -> None:
+        """Register a local soundbooth control WebSocket."""
+        self._soundbooth[ws] = wants_audio
 
     def unregister(self, ws: WebSocket) -> None:
-        self._listeners.discard(ws)
+        """Unregister a local soundbooth control WebSocket."""
+        self._soundbooth.pop(ws, None)
 
-    async def broadcast_audio(self, pcm_bytes: bytes) -> None:
-        stale: list[WebSocket] = []
-        for ws in list(self._listeners):
+    async def register_listener(self, ws: WebSocket) -> asyncio.Queue[tuple[str, Any]]:
+        """Register a congregation mobile listener and notify everyone of the new count."""
+        q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=48)
+        self._listeners[ws] = q
+        await self._broadcast_listener_count()
+        return q
+
+    async def unregister_listener(self, ws: WebSocket) -> None:
+        """Remove a congregation mobile listener and broadcast updated count."""
+        removed = self._listeners.pop(ws, None)
+        if removed is not None:
+            await self._broadcast_listener_count()
+
+    def _enqueue_listener(self, q: asyncio.Queue[tuple[str, Any]], item: tuple[str, Any]) -> None:
+        """Push an item into a listener's bounded queue, dropping oldest audio if congested."""
+        if q.full():
             try:
-                await ws.send_bytes(pcm_bytes)
-            except Exception:
-                stale.append(ws)
-        for ws in stale:
-            self._listeners.discard(ws)
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            pass
 
-    async def broadcast_event(self, payload: dict[str, Any]) -> None:
+    def _session_state_payload(self) -> dict[str, Any]:
+        dir_spec = get_direction_spec(self.direction)
+        return {
+            "type": "session_state",
+            "live": self.live,
+            "paused": self.paused,
+            "direction": self.direction,
+            "direction_label": dir_spec["label"],
+            "target_lang_label": dir_spec["target_title"],
+            "source_lang_label": dir_spec["source_title"],
+            "active_turn_id": self.active_turn_id,
+            "listener_count": self.listener_count,
+        }
+
+    def build_welcome_payload(self) -> dict[str, Any]:
+        payload = self._session_state_payload()
+        payload["type"] = "welcome"
+        payload["history"] = list(self._history)
+        return payload
+
+    def build_status_snapshot(self, include_admin: bool = False, port: int | None = None) -> dict[str, Any]:
+        dir_spec = get_direction_spec(self.direction)
+        snap: dict[str, Any] = {
+            "live": self.live,
+            "paused": self.paused,
+            "direction": self.direction,
+            "direction_label": dir_spec["label"],
+            "target_lang_label": dir_spec["target_title"],
+            "source_lang_label": dir_spec["source_title"],
+            "requires_pin": bool(self.room_pin),
+            "listener_count": self.listener_count,
+        }
+        if include_admin:
+            resolved_port = port or int(os.getenv("PORT", "8765"))
+            lan_ip = detect_lan_ip()
+            lan_listen_url = f"http://{lan_ip}:{resolved_port}/listen"
+            pub_listen_url = normalize_listen_url(self.public_url)
+            snap.update(
+                {
+                    "lan_ip": lan_ip,
+                    "port": resolved_port,
+                    "lan_listen_url": lan_listen_url,
+                    "public_url": self.public_url,
+                    "effective_listen_url": pub_listen_url or lan_listen_url,
+                    "room_pin": self.room_pin,
+                    "model": self.model,
+                    "transport": self.transport,
+                }
+            )
+        return snap
+
+    def _get_or_create_history_entry(self, turn_id: int) -> dict[str, Any]:
+        entry = self._history_by_turn.get(turn_id)
+        if entry is not None:
+            return entry
+        if len(self._history) >= self._history.maxlen:
+            oldest = self._history[0]
+            self._history_by_turn.pop(oldest["turn_id"], None)
+        entry = {
+            "turn_id": turn_id,
+            "target_text": "",
+            "stash_text": "",
+            "source_text": "",
+            "source_stash": "",
+            "finalized": False,
+            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        }
+        self._history.append(entry)
+        self._history_by_turn[turn_id] = entry
+        return entry
+
+    def _update_history_from_event(self, payload: dict[str, Any]) -> None:
+        ev_type = payload.get("type", "")
+        turn_id = payload.get("turn_id")
+
+        if ev_type == "output_transcript" and turn_id is not None:
+            entry = self._get_or_create_history_entry(int(turn_id))
+            entry["target_text"] += payload.get("text") or ""
+            entry["stash_text"] = ""
+        elif ev_type == "output_transcript_replace" and turn_id is not None:
+            entry = self._get_or_create_history_entry(int(turn_id))
+            entry["target_text"] = payload.get("text") or ""
+            entry["stash_text"] = payload.get("stash") or ""
+        elif ev_type == "input_transcript" and turn_id is not None:
+            entry = self._get_or_create_history_entry(int(turn_id))
+            entry["source_text"] += payload.get("text") or ""
+            entry["source_stash"] = ""
+        elif ev_type == "input_transcript_replace" and turn_id is not None:
+            entry = self._get_or_create_history_entry(int(turn_id))
+            entry["source_text"] = payload.get("text") or ""
+            entry["source_stash"] = payload.get("stash") or ""
+        elif ev_type == "turn_complete" and turn_id is not None:
+            entry = self._history_by_turn.get(int(turn_id))
+            if entry:
+                if entry["stash_text"]:
+                    entry["target_text"] = (entry["target_text"] + entry["stash_text"]).strip()
+                    entry["stash_text"] = ""
+                if entry["source_stash"]:
+                    entry["source_text"] = (entry["source_text"] + entry["source_stash"]).strip()
+                    entry["source_stash"] = ""
+                entry["finalized"] = True
+        elif ev_type in ("audio_turn", "active_turn"):
+            self.active_turn_id = int(turn_id) if turn_id is not None else None
+
+    async def start_session(
+        self,
+        model: str,
+        direction: str,
+        transport: str = "websocket",
+        source_ws: WebSocket | None = None,
+    ) -> None:
+        self.live = True
+        self.paused = False
+        self.model = model
+        self.direction = direction if direction in DIRECTIONS else "zh-en"
+        self.transport = transport
+        self.active_turn_id = None
+        self.active_source_ws = source_ws
+        self._history.clear()
+        self._history_by_turn.clear()
+        await self._broadcast_to_listeners_json(self._session_state_payload())
+
+    async def set_paused(self, paused: bool) -> None:
+        self.paused = bool(paused)
+        if self.paused:
+            self.active_turn_id = None
+        await self._broadcast_to_listeners_json(self._session_state_payload())
+
+    async def stop_session(self, source_ws: WebSocket | None = None) -> None:
+        if source_ws is not None and self.active_source_ws is not None and source_ws is not self.active_source_ws:
+            return
+        self.live = False
+        self.paused = False
+        self.active_turn_id = None
+        self.active_source_ws = None
+        await self._broadcast_to_listeners_json(self._session_state_payload())
+
+    async def _broadcast_listener_count(self) -> None:
+        payload = {"type": "listener_count", "count": self.listener_count}
+        await self._broadcast_to_soundbooth_json(payload)
+        await self._broadcast_to_listeners_json(payload)
+
+    async def _broadcast_to_soundbooth_json(self, payload: dict[str, Any]) -> None:
+        if not self._soundbooth:
+            return
         text = json.dumps(payload, ensure_ascii=False)
         stale: list[WebSocket] = []
-        for ws in list(self._listeners):
+        for ws in list(self._soundbooth):
             try:
                 await ws.send_text(text)
             except Exception:
                 stale.append(ws)
         for ws in stale:
-            self._listeners.discard(ws)
+            self._soundbooth.pop(ws, None)
+
+    async def _broadcast_to_listeners_json(self, payload: dict[str, Any]) -> None:
+        if not self._listeners:
+            return
+        text = json.dumps(payload, ensure_ascii=False)
+        for q in list(self._listeners.values()):
+            self._enqueue_listener(q, ("text", text))
+
+    async def broadcast_audio(self, pcm_bytes: bytes, turn_id: int | None = None) -> None:
+        if not pcm_bytes:
+            return
+        # 1. Soundbooth local WS playback (raw 24kHz Int16 PCM)
+        stale: list[WebSocket] = []
+        for ws, wants_audio in list(self._soundbooth.items()):
+            if not wants_audio:
+                continue
+            try:
+                await ws.send_bytes(pcm_bytes)
+            except Exception:
+                stale.append(ws)
+        for ws in stale:
+            self._soundbooth.pop(ws, None)
+
+        # 2. Congregation mobile listeners (encoded once to 24kHz G.711 μ-law with 5-byte header)
+        if self._listeners:
+            effective_turn = turn_id if turn_id is not None else (self.active_turn_id or 0)
+            ulaw_payload = pcm16_to_ulaw(pcm_bytes)
+            if ulaw_payload:
+                frame = struct.pack("<BI", self.AUDIO_CODEC_ULAW_24K, max(0, int(effective_turn))) + ulaw_payload
+                for q in list(self._listeners.values()):
+                    self._enqueue_listener(q, ("bytes", frame))
+
+    async def broadcast_event(self, payload: dict[str, Any], include_soundbooth: bool = True) -> None:
+        self._update_history_from_event(payload)
+        if include_soundbooth:
+            await self._broadcast_to_soundbooth_json(payload)
+        ev_type = payload.get("type", "")
+        if ev_type in _LISTENER_PUBLIC_EVENT_TYPES:
+            await self._broadcast_to_listeners_json(payload)
+
+
+# Global Mode 2 broadcast hub shared across soundbooth and all congregation mobile listeners
+broadcast_hub = BroadcastHub()
 
 
 class TranscriptLogger:
@@ -1047,7 +1394,7 @@ class QwenLiveTranslationBridge:
                         last_sent_audio_turn_id = self._turn_id
                     turn_has_output = True
                     self.metrics.output_audio_bytes += len(audio_bytes)
-                    await self.hub.broadcast_audio(audio_bytes)
+                    await self.hub.broadcast_audio(audio_bytes, turn_id=self._turn_id)
                 continue
 
             # 2. Translated target subtitle stream (supports both text+stash and delta)
@@ -1518,7 +1865,7 @@ class LiveTranslationBridge:
                                 turn_has_output = True
                                 audio_bytes = inline_data.data
                                 self.metrics.output_audio_bytes += len(audio_bytes)
-                                await self.hub.broadcast_audio(audio_bytes)
+                                await self.hub.broadcast_audio(audio_bytes, turn_id=self._turn_id)
 
                     in_tr = getattr(content, "input_transcription", None)
                     if in_tr and getattr(in_tr, "text", None):
@@ -1621,15 +1968,23 @@ class LiveTranslationBridge:
             )
 
 
-async def homepage(_request: Request) -> FileResponse:
+async def homepage(request: Request) -> Response:
+    if not is_local_admin_request(request):
+        return RedirectResponse(url="/listen", status_code=302)
     return FileResponse(STATIC_DIR / "index.html")
+
+
+async def listen_page(_request: Request) -> FileResponse:
+    return FileResponse(STATIC_DIR / "listen.html")
 
 
 async def api_health(_request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-async def api_config(_request: Request) -> JSONResponse:
+async def api_config(request: Request) -> JSONResponse:
+    if not is_local_admin_request(request):
+        return JSONResponse({"error": "仅限本机音控台访问"}, status_code=403)
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     has_gemini_key = bool(
         gemini_key and gemini_key != "your_google_ai_studio_api_key_here"
@@ -1672,12 +2027,18 @@ async def api_config(_request: Request) -> JSONResponse:
 
 
 async def ws_translate(websocket: WebSocket) -> None:
+    if not is_local_admin_request(websocket):
+        await websocket.close(code=4403)
+        return
     await websocket.accept()
-    hub = BroadcastHub()
-    hub.register(websocket)
+    hub = broadcast_hub
+    hub.register(websocket, wants_audio=True)
     bridge: LiveTranslationBridge | QwenLiveTranslationBridge | None = None
 
     try:
+        await websocket.send_text(
+            json.dumps({"type": "listener_count", "count": hub.listener_count})
+        )
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
@@ -1755,6 +2116,12 @@ async def ws_translate(websocket: WebSocket) -> None:
                         payload.get("sermon_context"),
                     )
 
+                    await hub.start_session(
+                        model=model_id,
+                        direction=direction,
+                        transport="websocket",
+                        source_ws=websocket,
+                    )
                     bridge = QwenLiveTranslationBridge(
                         hub=hub,
                         api_key=dashscope_key,
@@ -1794,6 +2161,12 @@ async def ws_translate(websocket: WebSocket) -> None:
                         direction=direction,
                     )
 
+                    await hub.start_session(
+                        model=model_id,
+                        direction=direction,
+                        transport="websocket",
+                        source_ws=websocket,
+                    )
                     bridge = LiveTranslationBridge(
                         hub=hub,
                         api_key=gemini_key,
@@ -1814,6 +2187,7 @@ async def ws_translate(websocket: WebSocket) -> None:
             elif msg_type == "pause":
                 if bridge:
                     await bridge.notify_audio_pause()
+                    await hub.set_paused(True)
                     await websocket.send_text(
                         json.dumps(
                             {
@@ -1827,6 +2201,7 @@ async def ws_translate(websocket: WebSocket) -> None:
 
             elif msg_type == "resume":
                 if bridge:
+                    await hub.set_paused(False)
                     await websocket.send_text(
                         json.dumps(
                             {
@@ -1842,17 +2217,21 @@ async def ws_translate(websocket: WebSocket) -> None:
                 if bridge:
                     await bridge.stop()
                     bridge = None
+                await hub.stop_session(source_ws=websocket)
 
     except WebSocketDisconnect:
         logger.info("Soundbooth client disconnected")
     finally:
         if bridge:
             await bridge.stop()
+        await hub.stop_session(source_ws=websocket)
         hub.unregister(websocket)
 
 
 async def api_qwen_webrtc_sdp(request: Request) -> JSONResponse:
     """Proxy WebRTC Offer/Answer SDP exchange to Alibaba Cloud Model Studio."""
+    if not is_local_admin_request(request):
+        return JSONResponse({"error": "仅限本机音控台访问"}, status_code=403)
     try:
         payload = await request.json()
     except Exception:
@@ -1989,6 +2368,8 @@ def update_env_var(key_name: str, value: str, env_path: Path | None = None) -> N
 
 async def api_keys(request: Request) -> JSONResponse:
     """Save or clear GEMINI_API_KEY / DASHSCOPE_API_KEY locally in .env."""
+    if not is_local_admin_request(request):
+        return JSONResponse({"error": "仅限本机音控台访问"}, status_code=403)
     try:
         payload = await request.json()
     except Exception:
@@ -2033,6 +2414,8 @@ async def api_keys(request: Request) -> JSONResponse:
 
 async def api_transcript_log(request: Request) -> JSONResponse:
     """Append a finalized bilingual line from a WebRTC session to its logs/ file."""
+    if not is_local_admin_request(request):
+        return JSONResponse({"error": "仅限本机音控台访问"}, status_code=403)
     try:
         payload = await request.json()
     except Exception:
@@ -2056,14 +2439,211 @@ async def api_transcript_log(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+async def api_broadcast_status(request: Request) -> JSONResponse:
+    """Return current Mode 2 broadcast status (public fields + admin fields on localhost)."""
+    is_admin = is_local_admin_request(request)
+    req_port = request.url.port or int(os.getenv("PORT", "8765"))
+    return JSONResponse(
+        broadcast_hub.build_status_snapshot(include_admin=is_admin, port=req_port)
+    )
+
+
+async def api_broadcast_settings(request: Request) -> JSONResponse:
+    """Update Mode 2 room PIN or public tunnel URL from the local soundbooth console."""
+    if not is_local_admin_request(request):
+        return JSONResponse({"error": "仅限本机音控台访问"}, status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "无效的 JSON 请求"}, status_code=400)
+
+    if "room_pin" in payload:
+        pin = str(payload.get("room_pin") or "").strip()
+        if pin and (len(pin) < 4 or len(pin) > 12 or not re.fullmatch(r"[A-Za-z0-9]+", pin)):
+            return JSONResponse(
+                {"error": "房间口令需为 4–12 位数字或字母，或留空关闭口令验证"},
+                status_code=400,
+            )
+        broadcast_hub.room_pin = pin
+        update_env_var("LISTENER_PIN", pin)
+
+    if "public_url" in payload:
+        pub = str(payload.get("public_url") or "").strip()
+        if pub and not re.match(r"^https?://", pub, re.IGNORECASE):
+            pub = f"https://{pub}"
+        if pub and len(pub) > 300:
+            return JSONResponse({"error": "公网地址过长"}, status_code=400)
+        broadcast_hub.public_url = pub.rstrip("/")
+        update_env_var("PUBLIC_BASE_URL", broadcast_hub.public_url)
+
+    req_port = request.url.port or int(os.getenv("PORT", "8765"))
+    return JSONResponse(
+        broadcast_hub.build_status_snapshot(include_admin=True, port=req_port)
+    )
+
+
+async def api_qrcode(request: Request) -> Response:
+    """Generate an offline crisp SVG QR code for congregation phones to scan."""
+    raw_url = (request.query_params.get("url") or "").strip()
+    if not raw_url:
+        req_port = request.url.port or int(os.getenv("PORT", "8765"))
+        raw_url = broadcast_hub.build_status_snapshot(
+            include_admin=True, port=req_port
+        )["effective_listen_url"]
+
+    if not raw_url.startswith(("http://", "https://")) or len(raw_url) > 512:
+        return JSONResponse({"error": "无效的二维码 URL"}, status_code=400)
+
+    qr = segno.make(raw_url, error="M")
+    buf = io.BytesIO()
+    qr.save(buf, kind="svg", scale=7, border=2, dark="#0f172a", light="#ffffff")
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def ws_broadcast(websocket: WebSocket) -> None:
+    """
+    Local-only soundbooth uplink WebSocket used by Qwen3.8 WebRTC mode to feed
+    translated 24kHz PCM audio + live captions into BroadcastHub for N congregation phones.
+    """
+    if not is_local_admin_request(websocket):
+        await websocket.close(code=4403)
+        return
+
+    await websocket.accept()
+    broadcast_hub.register(websocket, wants_audio=False)
+
+    try:
+        await websocket.send_text(
+            json.dumps({"type": "listener_count", "count": broadcast_hub.listener_count})
+        )
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+
+            raw_bytes = message.get("bytes")
+            if raw_bytes is not None:
+                if len(raw_bytes) >= 6:
+                    turn_id = struct.unpack("<I", raw_bytes[:4])[0]
+                    pcm_bytes = raw_bytes[4:]
+                    await broadcast_hub.broadcast_audio(
+                        pcm_bytes, turn_id=turn_id or None
+                    )
+                continue
+
+            raw_text = message.get("text")
+            if not raw_text:
+                continue
+
+            try:
+                payload = json.loads(raw_text)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = payload.get("type")
+            if msg_type == "broadcast_start":
+                await broadcast_hub.start_session(
+                    model=payload.get("model") or DEFAULT_MODEL_ID,
+                    direction=payload.get("direction") or "zh-en",
+                    transport=payload.get("transport") or "webrtc",
+                    source_ws=websocket,
+                )
+            elif msg_type == "pause_state":
+                await broadcast_hub.set_paused(bool(payload.get("paused")))
+            elif msg_type == "broadcast_stop":
+                await broadcast_hub.stop_session(source_ws=websocket)
+            elif msg_type in _LISTENER_PUBLIC_EVENT_TYPES:
+                await broadcast_hub.broadcast_event(payload, include_soundbooth=False)
+
+    except WebSocketDisconnect:
+        logger.info("Soundbooth WebRTC broadcast uplink disconnected")
+    finally:
+        await broadcast_hub.stop_session(source_ws=websocket)
+        broadcast_hub.unregister(websocket)
+
+
+async def ws_listen(websocket: WebSocket) -> None:
+    """Congregation mobile listener WebSocket: streams live translated audio + captions."""
+    await websocket.accept()
+
+    expected_pin = broadcast_hub.room_pin
+    provided_pin = (websocket.query_params.get("pin") or "").strip()
+    if expected_pin and provided_pin != expected_pin:
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "auth_required",
+                    "message": "请输入音控台显示的房间口令",
+                },
+                ensure_ascii=False,
+            )
+        )
+        await websocket.close(code=4401)
+        return
+
+    queue = await broadcast_hub.register_listener(websocket)
+
+    async def writer_loop() -> None:
+        try:
+            while True:
+                kind, data = await queue.get()
+                if kind == "bytes":
+                    await websocket.send_bytes(data)
+                else:
+                    await websocket.send_text(data)
+        except Exception:
+            return
+
+    writer_task: asyncio.Task[None] | None = None
+    try:
+        # Send welcome state + rolling recent caption history immediately
+        await websocket.send_text(
+            json.dumps(broadcast_hub.build_welcome_payload(), ensure_ascii=False)
+        )
+        writer_task = asyncio.create_task(writer_loop())
+
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            raw_text = message.get("text")
+            if raw_text:
+                try:
+                    req = json.loads(raw_text)
+                    if req.get("type") == "ping":
+                        await websocket.send_text(json.dumps({"type": "pong"}))
+                except json.JSONDecodeError:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if writer_task:
+            writer_task.cancel()
+            try:
+                await writer_task
+            except asyncio.CancelledError:
+                pass
+        await broadcast_hub.unregister_listener(websocket)
+
+
 routes = [
     Route("/", homepage),
+    Route("/listen", listen_page),
     Route("/api/health", api_health),
     Route("/api/config", api_config),
     Route("/api/keys", api_keys, methods=["POST"]),
     Route("/api/qwen/webrtc-sdp", api_qwen_webrtc_sdp, methods=["POST"]),
     Route("/api/transcript/log", api_transcript_log, methods=["POST"]),
+    Route("/api/broadcast/status", api_broadcast_status),
+    Route("/api/broadcast/settings", api_broadcast_settings, methods=["POST"]),
+    Route("/api/qrcode", api_qrcode),
     WebSocketRoute("/ws/translate", ws_translate),
+    WebSocketRoute("/ws/broadcast", ws_broadcast),
+    WebSocketRoute("/ws/listen", ws_listen),
     Mount("/static", app=StaticFiles(directory=STATIC_DIR), name="static"),
 ]
 
@@ -2072,6 +2652,6 @@ app = Starlette(routes=routes)
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("HOST", "127.0.0.1")
+    host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8765"))
     uvicorn.run("server:app", host=host, port=port, reload=False)

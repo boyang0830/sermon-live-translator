@@ -289,6 +289,9 @@ def test_websocket_missing_keys_return_clear_errors(monkeypatch):
     client = TestClient(server.app)
 
     with client.websocket_connect("/ws/translate") as ws:
+        initial = ws.receive_json()
+        assert initial["type"] == "listener_count"
+
         ws.send_json(
             {
                 "type": "start",
@@ -312,3 +315,165 @@ def test_websocket_missing_keys_return_clear_errors(monkeypatch):
         assert msg2["type"] == "error"
         assert msg2["fatal"] is True
         assert "GEMINI_API_KEY" in msg2["message"]
+
+
+def test_mode2_listener_page_qrcode_and_tunnel_admin_protection():
+    client = TestClient(server.app)
+
+    # /listen and its static assets load cleanly
+    r_listen = client.get("/listen")
+    assert r_listen.status_code == 200
+    assert "实时同声传译" in r_listen.text
+    for asset in ("/static/listen.css", "/static/listen.js"):
+        r_asset = client.get(asset)
+        assert r_asset.status_code == 200
+
+    # Offline SVG QR code generator
+    r_qr = client.get("/api/qrcode", params={"url": "http://192.168.1.50:8765/listen"})
+    assert r_qr.status_code == 200
+    assert "image/svg+xml" in r_qr.headers["content-type"]
+    assert "<svg" in r_qr.text
+
+    # Requests arriving through Cloudflare Tunnel / reverse proxy must NEVER reach admin routes
+    tunnel_headers = {"CF-Connecting-IP": "203.0.113.10", "X-Forwarded-For": "203.0.113.10"}
+
+    r_root = client.get("/", headers=tunnel_headers, follow_redirects=False)
+    assert r_root.status_code == 302
+    assert r_root.headers["location"] == "/listen"
+
+    assert client.get("/api/config", headers=tunnel_headers).status_code == 403
+    assert (
+        client.post(
+            "/api/keys",
+            headers=tunnel_headers,
+            json={"provider": "gemini", "action": "clear"},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/broadcast/settings",
+            headers=tunnel_headers,
+            json={"room_pin": "9999"},
+        ).status_code
+        == 403
+    )
+
+    # Public broadcast status omits admin-only fields for proxied requests
+    r_pub_status = client.get("/api/broadcast/status", headers=tunnel_headers)
+    assert r_pub_status.status_code == 200
+    pub_data = r_pub_status.json()
+    assert "live" in pub_data
+    assert "listener_count" in pub_data
+    assert "room_pin" not in pub_data
+    assert "lan_ip" not in pub_data
+
+
+def test_mode2_1_to_n_fanout_ulaw_audio_late_join_and_pin(tmp_path, monkeypatch):
+    import struct
+
+    fake_env = tmp_path / ".env"
+    fake_env.write_text("HOST=0.0.0.0\n", encoding="utf-8")
+    monkeypatch.setattr(server, "ENV_FILE", fake_env)
+
+    # Reset hub state cleanly for test isolation
+    server.broadcast_hub.room_pin = ""
+    server.broadcast_hub.public_url = ""
+    client = TestClient(server.app)
+
+    # 1. Soundbooth connects WebRTC broadcast uplink + starts session
+    with client.websocket_connect("/ws/broadcast") as sb_ws:
+        assert sb_ws.receive_json()["type"] == "listener_count"
+        sb_ws.send_json(
+            {
+                "type": "broadcast_start",
+                "model": "qwen3.8-livetranslate-flash-realtime",
+                "direction": "zh-en",
+                "transport": "webrtc",
+            }
+        )
+
+        # 2. Two congregation phones connect simultaneously
+        with client.websocket_connect("/ws/listen") as phone1, client.websocket_connect(
+            "/ws/listen"
+        ) as phone2:
+            w1 = phone1.receive_json()
+            w2 = phone2.receive_json()
+            assert w1["type"] == "welcome"
+            assert w1["live"] is True
+            assert w2["type"] == "welcome"
+            assert w2["listener_count"] == 2
+
+            # Soundbooth receives live listener count updates (1 then 2)
+            counts = []
+            while len(counts) < 2:
+                ev = sb_ws.receive_json()
+                if ev["type"] == "listener_count":
+                    counts.append(ev["count"])
+            assert counts[-1] == 2
+
+            # 3. Soundbooth broadcasts a translated caption + 24kHz PCM audio chunk (turn 7)
+            sb_ws.send_json(
+                {
+                    "type": "output_transcript_replace",
+                    "turn_id": 7,
+                    "text": "Grace and peace to you in Christ.",
+                    "stash": "",
+                }
+            )
+            pcm_samples = b"\x00\x10\x00\xf0" * 100  # 400 bytes -> 200 samples -> 200 ulaw bytes
+            sb_ws.send_bytes(struct.pack("<I", 7) + pcm_samples)
+
+            # Helper to drain listener_count notifications until target event
+            def next_non_count_json(ws):
+                for _ in range(5):
+                    m = ws.receive_json()
+                    if m.get("type") != "listener_count":
+                        return m
+                raise AssertionError("Expected non-count JSON message")
+
+            c1 = next_non_count_json(phone1)
+            c2 = next_non_count_json(phone2)
+            assert c1["type"] == "output_transcript_replace"
+            assert c1["text"] == "Grace and peace to you in Christ."
+            assert c2["text"] == "Grace and peace to you in Christ."
+
+            b1 = phone1.receive_bytes()
+            b2 = phone2.receive_bytes()
+            assert b1 == b2
+            codec, turn_id = struct.unpack("<BI", b1[:5])
+            assert codec == 2  # G.711 μ-law 24kHz
+            assert turn_id == 7
+            assert len(b1) == 5 + len(pcm_samples) // 2
+
+            # 4. A 3rd late-joining phone immediately receives recent caption history
+            with client.websocket_connect("/ws/listen") as phone3:
+                w3 = phone3.receive_json()
+                assert w3["type"] == "welcome"
+                assert any(
+                    item["turn_id"] == 7 and "Grace and peace" in item["target_text"]
+                    for item in w3["history"]
+                )
+
+    # 5. Optional Room PIN gate & public URL normalization
+    r_pin = client.post(
+        "/api/broadcast/settings",
+        json={"room_pin": "2026", "public_url": "sermon.example.com"},
+    )
+    assert r_pin.status_code == 200
+    snap = r_pin.json()
+    assert snap["requires_pin"] is True
+    assert snap["effective_listen_url"] == "https://sermon.example.com/listen"
+
+    with client.websocket_connect("/ws/listen") as bad_phone:
+        auth_msg = bad_phone.receive_json()
+        assert auth_msg["type"] == "auth_required"
+
+    with client.websocket_connect("/ws/listen?pin=2026") as ok_phone:
+        ok_welcome = ok_phone.receive_json()
+        assert ok_welcome["type"] == "welcome"
+
+    # Reset PIN & public_url cleanly
+    r_reset = client.post("/api/broadcast/settings", json={"room_pin": "", "public_url": ""})
+    assert r_reset.status_code == 200
+    assert r_reset.json()["requires_pin"] is False

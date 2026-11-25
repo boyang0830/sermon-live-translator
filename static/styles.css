@@ -848,6 +848,203 @@ body.is-resizing {
   margin: auto;
 }
 
+/* Mode 2: Congregation Mobile Broadcast Controls & Projector QR Modal */
+.metric-chip-btn {
+  cursor: pointer;
+  color: inherit;
+  font-family: inherit;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.metric-chip-btn:hover {
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+
+.listener-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  background: rgba(76, 141, 255, 0.14);
+  color: var(--accent);
+  border: 1px solid rgba(76, 141, 255, 0.28);
+}
+
+.listener-pill.live {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--success);
+  border-color: rgba(34, 197, 94, 0.32);
+}
+
+.broadcast-url-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  margin-bottom: 0.65rem;
+}
+
+.broadcast-url-label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.broadcast-url-link {
+  font-size: 0.84rem;
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.broadcast-url-link:hover {
+  text-decoration: underline;
+}
+
+.broadcast-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.65rem;
+}
+
+.broadcast-actions .btn {
+  flex: 1;
+}
+
+.broadcast-settings {
+  border-top: 1px solid var(--border);
+  padding-top: 0.55rem;
+}
+
+.broadcast-settings summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.broadcast-settings summary:hover {
+  color: var(--text);
+}
+
+.qr-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  background: rgba(5, 8, 16, 0.86);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+}
+
+.qr-modal-card {
+  width: min(680px, 100%);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 1.5rem;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+}
+
+.qr-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.qr-modal-header h2 {
+  margin: 0;
+  font-size: 1.45rem;
+}
+
+.qr-modal-sub {
+  margin: 0.25rem 0 0;
+  font-size: 0.92rem;
+  color: var(--text-muted);
+}
+
+.qr-modal-body {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.qr-frame {
+  flex: 0 0 auto;
+  background: #ffffff;
+  padding: 14px;
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.qr-frame img {
+  display: block;
+  width: 248px;
+  height: 248px;
+}
+
+.qr-meta {
+  flex: 1 1 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.qr-url-display {
+  font-size: 1.02rem;
+  font-weight: 600;
+  padding: 0.65rem 0.85rem;
+  border-radius: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  word-break: break-all;
+}
+
+.qr-pin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.55rem 0.9rem;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: var(--warning);
+  font-size: 1rem;
+}
+
+.qr-pin-badge strong {
+  font-size: 1.35rem;
+  letter-spacing: 0.14em;
+}
+
+.qr-stats-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.qr-tip {
+  margin: 0;
+  font-size: 0.84rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
 @media (max-width: 980px) {
   .workspace {
     grid-template-columns: 1fr;

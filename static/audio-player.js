@@ -1,11 +1,27 @@
 /**
- * Low-latency 24kHz 16-bit signed LE mono PCM streaming player for Gemini Live API.
- * Supports smooth jitter buffering, instant queue clear on interruption, volume control,
- * output device routing (AudioContext.setSinkId), and exact real-time playback tracking
- * by turnId so subtitles highlight in sync with spoken audio output.
+ * Low-latency 24kHz mono streaming player for Gemini Live API & Mode 2 congregation broadcast.
+ * Supports:
+ *   - Raw 24kHz 16-bit signed LE PCM (`enqueuePcm16`)
+ *   - Compressed 24kHz 8-bit G.711 μ-law (`enqueueUlaw24k`, 2x smaller for church Wi-Fi fan-out)
+ *   - Smooth jitter buffering + drift catch-up guard (`maxBufferSeconds`) so mobile phones never lag behind
+ *   - Output device routing (`AudioContext.setSinkId`) and real-time playback tracking by turnId
  */
+
+// Precomputed ITU-T G.711 μ-law -> Float32 [-1, 1] lookup table (zero GC overhead)
+const ULAW_DECODE_LUT = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  const u = ~i & 0xff;
+  const sign = u & 0x80;
+  const exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0f;
+  let sample = ((mantissa << 3) + 0x84) << exponent;
+  sample -= 0x84;
+  if (sign) sample = -sample;
+  ULAW_DECODE_LUT[i] = sample / 32768;
+}
+
 export class Pcm24kPlayer {
-  constructor({ onActiveTurnChange } = {}) {
+  constructor({ onActiveTurnChange, onAudioLevel, lookaheadSeconds = 0.06, maxBufferSeconds = 1.4 } = {}) {
     this.sampleRate = 24000;
     this.ctx = null;
     this.gainNode = null;
@@ -14,10 +30,12 @@ export class Pcm24kPlayer {
     this.volume = 1.0;
     this.muted = false;
     this.sinkId = "";
-    this.lookaheadSeconds = 0.06;
+    this.lookaheadSeconds = lookaheadSeconds;
+    this.maxBufferSeconds = maxBufferSeconds;
 
     // Exact audio playback timeline tracking for subtitle highlighting
     this.onActiveTurnChange = typeof onActiveTurnChange === "function" ? onActiveTurnChange : null;
+    this.onAudioLevel = typeof onAudioLevel === "function" ? onAudioLevel : null;
     this.segments = []; // { turnId, startTime, endTime }
     this.currentSpeakingTurnId = null;
     this.lastReportedProgress = -1;
@@ -129,15 +147,20 @@ export class Pcm24kPlayer {
     this._notifyTurn(null);
   }
 
-  enqueuePcm16(arrayBuffer, turnId = null) {
-    if (!this.ctx || !arrayBuffer || arrayBuffer.byteLength < 2) {
+  _scheduleFloat32(float32, turnId = null) {
+    if (!this.ctx || !float32 || float32.length === 0) {
       return;
     }
 
-    const int16 = new Int16Array(arrayBuffer);
-    const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-      float32[i] = int16[i] / 32768;
+    if (this.onAudioLevel) {
+      let sum = 0;
+      const step = Math.max(1, Math.floor(float32.length / 128));
+      let count = 0;
+      for (let i = 0; i < float32.length; i += step) {
+        sum += float32[i] * float32[i];
+        count++;
+      }
+      this.onAudioLevel(count > 0 ? Math.sqrt(sum / count) : 0);
     }
 
     const audioBuffer = this.ctx.createBuffer(1, float32.length, this.sampleRate);
@@ -148,6 +171,10 @@ export class Pcm24kPlayer {
     source.connect(this.gainNode);
 
     const now = this.ctx.currentTime;
+    // Catch-up guard: if mobile network jitter caused > maxBufferSeconds backlog, snap back to live
+    if (this.nextStartTime - now > this.maxBufferSeconds) {
+      this.clearQueue();
+    }
     if (this.nextStartTime < now + 0.01) {
       this.nextStartTime = now + this.lookaheadSeconds;
     }
@@ -157,7 +184,7 @@ export class Pcm24kPlayer {
     source.start(startTime);
     this.nextStartTime = endTime;
 
-    if (turnId !== null && turnId !== undefined) {
+    if (turnId !== null && turnId !== undefined && turnId > 0) {
       const last = this.segments[this.segments.length - 1];
       if (last && last.turnId === turnId && startTime <= last.endTime + 0.12) {
         last.endTime = Math.max(last.endTime, endTime);
@@ -171,6 +198,29 @@ export class Pcm24kPlayer {
     source.onended = () => {
       this.activeSources.delete(source);
     };
+  }
+
+  enqueuePcm16(arrayBuffer, turnId = null) {
+    if (!this.ctx || !arrayBuffer || arrayBuffer.byteLength < 2) {
+      return;
+    }
+    const int16 = new Int16Array(arrayBuffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 32768;
+    }
+    this._scheduleFloat32(float32, turnId);
+  }
+
+  enqueueUlaw24k(uint8View, turnId = null) {
+    if (!this.ctx || !uint8View || uint8View.byteLength < 1) {
+      return;
+    }
+    const float32 = new Float32Array(uint8View.length);
+    for (let i = 0; i < uint8View.length; i++) {
+      float32[i] = ULAW_DECODE_LUT[uint8View[i]];
+    }
+    this._scheduleFloat32(float32, turnId);
   }
 
   clearQueue() {

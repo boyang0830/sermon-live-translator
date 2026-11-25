@@ -4,10 +4,11 @@
  * 16-bit signed little-endian PCM, and emitting 100ms chunks (1,600 samples).
  */
 class Pcm16kCaptureProcessor extends AudioWorkletProcessor {
-  constructor() {
+  constructor(options) {
     super();
-    this.targetRate = 16000;
-    this.chunkSamples = 1600; // 100ms at 16kHz (official Gemini Live Translate spec)
+    const requestedRate = Number(options?.processorOptions?.targetRate);
+    this.targetRate = Number.isFinite(requestedRate) && requestedRate >= 8000 ? requestedRate : 16000;
+    this.chunkSamples = Math.round(this.targetRate * 0.1); // 100ms chunks (1,600 @ 16kHz, 2,400 @ 24kHz)
     this.buffer = new Int16Array(this.chunkSamples);
     this.writeIndex = 0;
     this.ratio = sampleRate / this.targetRate;

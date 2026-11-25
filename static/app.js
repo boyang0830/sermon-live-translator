@@ -93,6 +93,27 @@ const el = {
   fsFontSmallerBtn: document.getElementById("fsFontSmallerBtn"),
   fsFontLargerBtn: document.getElementById("fsFontLargerBtn"),
   exitFullscreenBtn: document.getElementById("exitFullscreenBtn"),
+
+  // Mode 2 Congregation Broadcast elements
+  listenerChipBtn: document.getElementById("listenerChipBtn"),
+  listenerCountDisplay: document.getElementById("listenerCountDisplay"),
+  broadcastStatusBadge: document.getElementById("broadcastStatusBadge"),
+  broadcastUrlType: document.getElementById("broadcastUrlType"),
+  broadcastListenUrl: document.getElementById("broadcastListenUrl"),
+  openQrModalBtn: document.getElementById("openQrModalBtn"),
+  copyListenUrlBtn: document.getElementById("copyListenUrlBtn"),
+  publicUrlInput: document.getElementById("publicUrlInput"),
+  roomPinInput: document.getElementById("roomPinInput"),
+  saveBroadcastSettingsBtn: document.getElementById("saveBroadcastSettingsBtn"),
+  broadcastSettingsHint: document.getElementById("broadcastSettingsHint"),
+  qrModal: document.getElementById("qrModal"),
+  closeQrModalBtn: document.getElementById("closeQrModalBtn"),
+  qrCodeImg: document.getElementById("qrCodeImg"),
+  qrModalUrl: document.getElementById("qrModalUrl"),
+  qrModalPinBadge: document.getElementById("qrModalPinBadge"),
+  qrModalPinValue: document.getElementById("qrModalPinValue"),
+  qrModalListeners: document.getElementById("qrModalListeners"),
+  qrCopyBtn: document.getElementById("qrCopyBtn"),
 };
 
 const state = {
@@ -102,6 +123,15 @@ const state = {
   glossaryByDirection: {},
 
   ws: null,
+  broadcastWs: null,
+  broadcastPollTimer: null,
+  broadcastInfo: {
+    listenerCount: 0,
+    effectiveListenUrl: "",
+    lanListenUrl: "",
+    publicUrl: "",
+    roomPin: "",
+  },
   webrtcClient: null,
   activeTransport: "websocket", // "webrtc" | "websocket"
   captureCtx: null,
@@ -196,7 +226,7 @@ function updateHeaderSubtitle() {
   if (!dirSpec || !modelSpec) return;
   const shortModel =
     modelSpec.provider === "dashscope" ? "Qwen3.8-LiveTranslate" : modelSpec.id;
-  el.headerSubtitle.textContent = `${dirSpec.short_label} · ${shortModel} (单机音控版)`;
+  el.headerSubtitle.textContent = `${dirSpec.short_label} · ${shortModel} (音控台 + 会众广播版)`;
 }
 
 function setUiState(mode, message) {
@@ -887,7 +917,217 @@ function stopTimer() {
   state.timerHandle = null;
 }
 
+function updateListenerCountUI(count) {
+  const n = Math.max(0, Number(count) || 0);
+  state.broadcastInfo.listenerCount = n;
+  if (el.listenerCountDisplay) {
+    el.listenerCountDisplay.textContent = String(n);
+  }
+  if (el.broadcastStatusBadge) {
+    const livePrefix = state.running && !state.paused ? "广播中 · " : "";
+    el.broadcastStatusBadge.textContent = `${livePrefix}🎧 ${n} 人在线`;
+    el.broadcastStatusBadge.classList.toggle("live", state.running && !state.paused);
+  }
+  if (el.qrModalListeners) {
+    el.qrModalListeners.textContent = `🎧 当前 ${n} 人在线`;
+    el.qrModalListeners.classList.toggle("live", state.running && !state.paused);
+  }
+}
+
+function renderBroadcastInfo(info) {
+  if (!info) return;
+  state.broadcastInfo.effectiveListenUrl = info.effective_listen_url || "";
+  state.broadcastInfo.lanListenUrl = info.lan_listen_url || "";
+  state.broadcastInfo.publicUrl = info.public_url || "";
+  state.broadcastInfo.roomPin = info.room_pin || "";
+  updateListenerCountUI(info.listener_count ?? state.broadcastInfo.listenerCount);
+
+  const isPublic = Boolean(info.public_url);
+  if (el.broadcastUrlType) {
+    el.broadcastUrlType.textContent = isPublic
+      ? "公网穿透收听地址（Wi-Fi 与 5G 通用）"
+      : "局域网 Wi-Fi 收听地址（会众连教会 Wi-Fi 扫码）";
+  }
+  if (el.broadcastListenUrl && info.effective_listen_url) {
+    el.broadcastListenUrl.textContent = info.effective_listen_url;
+    el.broadcastListenUrl.href = info.effective_listen_url;
+  }
+  if (el.publicUrlInput && document.activeElement !== el.publicUrlInput) {
+    el.publicUrlInput.value = info.public_url || "";
+  }
+  if (el.roomPinInput && document.activeElement !== el.roomPinInput) {
+    el.roomPinInput.value = info.room_pin || "";
+  }
+  if (el.broadcastSettingsHint) {
+    el.broadcastSettingsHint.textContent = info.room_pin
+      ? `已开启房间口令保护（当前口令：${info.room_pin}）；清空后点保存可恢复免密扫码。`
+      : "当前为免密扫码直进；如需防外部误入，可填 4–12 位数字或字母后保存。";
+  }
+
+  // Keep open QR modal synced if settings changed
+  if (el.qrModal && !el.qrModal.classList.contains("hidden")) {
+    refreshQrModalContent();
+  }
+}
+
+async function refreshBroadcastStatus() {
+  try {
+    const res = await fetch("/api/broadcast/status");
+    if (!res.ok) return;
+    const data = await res.json();
+    renderBroadcastInfo(data);
+  } catch {
+    // Ignore transient polling errors
+  }
+}
+
+function refreshQrModalContent() {
+  const url = state.broadcastInfo.effectiveListenUrl || `${window.location.origin}/listen`;
+  if (el.qrModalUrl) {
+    el.qrModalUrl.textContent = url;
+  }
+  if (el.qrCodeImg) {
+    el.qrCodeImg.src = `/api/qrcode?url=${encodeURIComponent(url)}&t=${Date.now()}`;
+  }
+  if (el.qrModalPinBadge && el.qrModalPinValue) {
+    if (state.broadcastInfo.roomPin) {
+      el.qrModalPinValue.textContent = state.broadcastInfo.roomPin;
+      el.qrModalPinBadge.classList.remove("hidden");
+    } else {
+      el.qrModalPinBadge.classList.add("hidden");
+    }
+  }
+  updateListenerCountUI(state.broadcastInfo.listenerCount);
+}
+
+async function openQrModal() {
+  await refreshBroadcastStatus();
+  refreshQrModalContent();
+  el.qrModal?.classList.remove("hidden");
+}
+
+function closeQrModal() {
+  el.qrModal?.classList.add("hidden");
+}
+
+async function copyListenUrl(buttonEl) {
+  const url = state.broadcastInfo.effectiveListenUrl || `${window.location.origin}/listen`;
+  try {
+    await navigator.clipboard.writeText(url);
+    const orig = buttonEl.textContent;
+    buttonEl.textContent = "已复制 ✓";
+    setTimeout(() => {
+      buttonEl.textContent = orig;
+    }, 1800);
+  } catch {
+    showBanner(`请手动复制听众收听链接：${url}`, "info");
+  }
+}
+
+async function saveBroadcastSettings() {
+  const roomPin = (el.roomPinInput?.value || "").trim();
+  const publicUrl = (el.publicUrlInput?.value || "").trim();
+  try {
+    const res = await fetch("/api/broadcast/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room_pin: roomPin, public_url: publicUrl }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showBanner(data.error || "保存广播设置失败");
+      return;
+    }
+    hideBanner();
+    renderBroadcastInfo(data);
+    showBanner(
+      data.room_pin
+        ? `会众广播设置已保存（口令：${data.room_pin}，已同步更新二维码）。`
+        : "会众广播设置已保存（免密扫码直进，已同步更新二维码）。",
+      "info"
+    );
+  } catch (err) {
+    showBanner(`保存广播设置失败：${err.message}`);
+  }
+}
+
+function openWebRtcBroadcastUplink(model, direction) {
+  closeWebRtcBroadcastUplink(false);
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${window.location.host}/ws/broadcast`);
+  ws.binaryType = "arraybuffer";
+  state.broadcastWs = ws;
+
+  ws.onopen = () => {
+    ws.send(
+      JSON.stringify({
+        type: "broadcast_start",
+        model,
+        direction,
+        transport: "webrtc",
+      })
+    );
+  };
+
+  ws.onmessage = (event) => {
+    if (typeof event.data !== "string") return;
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "listener_count") {
+        updateListenerCountUI(msg.count);
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
+  ws.onclose = () => {
+    if (state.broadcastWs === ws) {
+      state.broadcastWs = null;
+    }
+  };
+}
+
+function sendBroadcastJson(payload) {
+  const ws = state.broadcastWs;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+  }
+}
+
+function sendBroadcastAudio(pcmBuffer, turnId) {
+  const ws = state.broadcastWs;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !pcmBuffer) return;
+  if (state.broadcastInfo.listenerCount <= 0) return;
+  // Pack 4-byte uint32 LE turnId + raw 24kHz Int16 PCM
+  const frame = new Uint8Array(4 + pcmBuffer.byteLength);
+  const view = new DataView(frame.buffer);
+  view.setUint32(0, Math.max(0, Number(turnId) || 0), true);
+  frame.set(new Uint8Array(pcmBuffer), 4);
+  ws.send(frame.buffer);
+}
+
+function closeWebRtcBroadcastUplink(notifyStop = true) {
+  const ws = state.broadcastWs;
+  state.broadcastWs = null;
+  if (!ws) return;
+  if (notifyStop && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({ type: "broadcast_stop" }));
+    } catch {
+      // Ignore
+    }
+  }
+  try {
+    ws.close();
+  } catch {
+    // Ignore
+  }
+}
+
 async function startQwenWebRtcSession() {
+  openWebRtcBroadcastUplink(el.modelSelect.value, state.direction);
+
   const client = new QwenWebRtcClient({
     onStatus: (mode, message, logFile) => {
       if (logFile) {
@@ -896,6 +1136,7 @@ async function startQwenWebRtcSession() {
       if (mode === "live") {
         hideBanner();
         setUiState("live", message);
+        updateListenerCountUI(state.broadcastInfo.listenerCount);
       } else if (mode === "connecting") {
         setUiState("connecting", message);
       }
@@ -913,21 +1154,40 @@ async function startQwenWebRtcSession() {
     },
     onActiveTurnChange: (turnId) => {
       setSpeakingTurn(turnId);
+      sendBroadcastJson({ type: "active_turn", turn_id: turnId });
+    },
+    onRemotePcm: (pcmBuffer, turnId) => {
+      sendBroadcastAudio(pcmBuffer, turnId);
     },
     onTargetDelta: (turnId, delta) => {
       appendTargetTranscript(turnId, delta);
+      sendBroadcastJson({ type: "output_transcript", turn_id: turnId, text: delta });
     },
     onTargetReplace: (turnId, confirmed, stash) => {
       replaceTargetTranscript(turnId, confirmed, stash);
+      sendBroadcastJson({
+        type: "output_transcript_replace",
+        turn_id: turnId,
+        text: confirmed,
+        stash,
+      });
     },
     onSourceDelta: (turnId, delta) => {
       appendSourceTranscript(turnId, delta);
+      sendBroadcastJson({ type: "input_transcript", turn_id: turnId, text: delta });
     },
     onSourceReplace: (turnId, confirmed, stash) => {
       replaceSourceTranscript(turnId, confirmed, stash);
+      sendBroadcastJson({
+        type: "input_transcript_replace",
+        turn_id: turnId,
+        text: confirmed,
+        stash,
+      });
     },
     onTurnComplete: (turnId, logFile) => {
       finalizeTurn(turnId, logFile);
+      sendBroadcastJson({ type: "turn_complete", turn_id: turnId });
     },
     onStats: (stats) => {
       updateStats(stats);
@@ -1061,7 +1321,9 @@ async function startSession() {
       return;
     }
 
-    if (msg.type === "audio_turn") {
+    if (msg.type === "listener_count") {
+      updateListenerCountUI(msg.count);
+    } else if (msg.type === "audio_turn") {
       state.activeAudioTurnId = msg.turn_id;
     } else if (msg.type === "status") {
       if (msg.log_file) {
@@ -1073,10 +1335,12 @@ async function startSession() {
       if (msg.state === "live") {
         hideBanner();
         setUiState("live", msg.message);
+        updateListenerCountUI(state.broadcastInfo.listenerCount);
       } else if (msg.state === "connecting") {
         setUiState("connecting", msg.message);
       } else if (msg.state === "paused") {
         setUiState("paused", msg.message);
+        updateListenerCountUI(state.broadcastInfo.listenerCount);
       } else if (msg.state === "stopped") {
         stopSession(false);
       }
@@ -1121,11 +1385,13 @@ function togglePause() {
   if (state.activeTransport === "webrtc" && state.webrtcClient) {
     state.paused = !state.paused;
     state.webrtcClient.setPaused(state.paused);
+    sendBroadcastJson({ type: "pause_state", paused: state.paused });
     if (state.paused) {
       setUiState("paused", "已暂停收音（唱诗/祷告期间关闭上行音轨）");
     } else {
       setUiState("live", "已恢复 WebRTC 实时收音翻译");
     }
+    updateListenerCountUI(state.broadcastInfo.listenerCount);
     return;
   }
 
@@ -1138,6 +1404,7 @@ function togglePause() {
     state.ws.send(JSON.stringify({ type: "resume" }));
     setUiState("live", "已恢复实时收音翻译");
   }
+  updateListenerCountUI(state.broadcastInfo.listenerCount);
 }
 
 async function stopSession(notifyServer = true) {
@@ -1147,6 +1414,8 @@ async function stopSession(notifyServer = true) {
   finalizeTurn(null);
   state.player.clearQueue();
   state.activeAudioTurnId = null;
+
+  closeWebRtcBroadcastUplink(notifyServer);
 
   if (state.webrtcClient) {
     const client = state.webrtcClient;
@@ -1174,6 +1443,7 @@ async function stopSession(notifyServer = true) {
   }
 
   setUiState("idle", "已停止，随时可重新开始或切换模型/翻译方向");
+  updateListenerCountUI(state.broadcastInfo.listenerCount);
 }
 
 function exportTranscript() {
@@ -1516,11 +1786,30 @@ async function init() {
     el.fullscreenOverlay.classList.add("hidden");
   });
 
+  // Mode 2 Congregation Broadcast controls
+  el.listenerChipBtn?.addEventListener("click", openQrModal);
+  el.openQrModalBtn?.addEventListener("click", openQrModal);
+  el.closeQrModalBtn?.addEventListener("click", closeQrModal);
+  el.qrModal?.addEventListener("click", (e) => {
+    if (e.target === el.qrModal) closeQrModal();
+  });
+  el.copyListenUrlBtn?.addEventListener("click", () => copyListenUrl(el.copyListenUrlBtn));
+  el.qrCopyBtn?.addEventListener("click", () => copyListenUrl(el.qrCopyBtn));
+  el.saveBroadcastSettingsBtn?.addEventListener("click", saveBroadcastSettings);
+
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !el.fullscreenOverlay.classList.contains("hidden")) {
-      el.fullscreenOverlay.classList.add("hidden");
+    if (e.key === "Escape") {
+      if (el.qrModal && !el.qrModal.classList.contains("hidden")) {
+        closeQrModal();
+      } else if (!el.fullscreenOverlay.classList.contains("hidden")) {
+        el.fullscreenOverlay.classList.add("hidden");
+      }
     }
   });
+
+  await refreshBroadcastStatus();
+  clearInterval(state.broadcastPollTimer);
+  state.broadcastPollTimer = setInterval(refreshBroadcastStatus, 4000);
 }
 
 init().catch((err) => {

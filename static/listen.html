@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>教会实时同声传译 · Live Sermon Interpretation</title>
+  <link rel="stylesheet" href="/static/listen.css" />
+</head>
+<body>
+  <div class="listen-shell">
+    <!-- Sticky Top Header -->
+    <header class="listen-header">
+      <div class="listen-brand">
+        <span class="status-dot" id="statusDot" aria-hidden="true"></span>
+        <div>
+          <h1 class="listen-title">实时同声传译 · Live Interpretation</h1>
+          <p class="listen-sub" id="directionSubtitle">等待音控台开始广播...</p>
+        </div>
+      </div>
+      <div class="header-right">
+        <span class="status-badge" id="statusBadge">待机</span>
+        <button type="button" class="icon-btn" id="themeBtn" aria-label="切换深浅色主题" title="深色 / 浅色">
+          ☀
+        </button>
+      </div>
+    </header>
+
+    <!-- Optional PIN Gate Overlay -->
+    <section class="pin-gate hidden" id="pinGate" aria-label="房间口令验证">
+      <div class="pin-card">
+        <div class="pin-icon" aria-hidden="true">🎧</div>
+        <h2>输入房间口令 · Enter Room PIN</h2>
+        <p class="pin-desc">请输入大屏或音控台显示的口令以加入实时语音与字幕收听。</p>
+        <form id="pinForm" class="pin-form">
+          <input
+            type="text"
+            id="pinInput"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            maxlength="12"
+            placeholder="例如 1234"
+            required
+          />
+          <button type="submit" class="btn-primary-lg" id="pinSubmitBtn">
+            进入收听 · Join
+          </button>
+        </form>
+        <p class="pin-error hidden" id="pinError" role="alert"></p>
+      </div>
+    </section>
+
+    <!-- Prominent One-Tap Audio Unlock Banner (iOS Safari / Android Chrome autoplay policy) -->
+    <div class="audio-prompt" id="audioPrompt">
+      <button type="button" class="audio-unlock-btn" id="unlockAudioBtn">
+        <span class="unlock-icon" aria-hidden="true">🎧</span>
+        <span class="unlock-text">
+          <strong>点击开启实时语音播报</strong>
+          <small>Tap to Listen with Headphones · 请佩戴耳机</small>
+        </span>
+      </button>
+    </div>
+
+    <!-- Pause / Waiting Notice Banner -->
+    <div class="notice-banner hidden" id="noticeBanner" role="status" aria-live="polite"></div>
+
+    <!-- Live Single-Sentence Focus Caption Stream -->
+    <main class="caption-viewport" id="captionViewport" aria-live="polite">
+      <div class="empty-placeholder" id="emptyPlaceholder">
+        <div class="placeholder-icon" aria-hidden="true">✝</div>
+        <p class="placeholder-main" id="placeholderMain">已连接教会同传频道</p>
+        <p class="placeholder-sub" id="placeholderSub">
+          讲员开始讲道后，实时译文语音与字幕将自动出现。<br />
+          Live audio and captions will begin automatically when the sermon starts.
+        </p>
+      </div>
+    </main>
+
+    <!-- Floating Jump-to-Latest Pill -->
+    <button type="button" class="jump-latest-btn hidden" id="jumpLatestBtn">
+      ↓ 回到最新字幕 · Latest
+    </button>
+
+    <!-- Thumb-Friendly Bottom Control Bar -->
+    <footer class="control-dock">
+      <button type="button" class="dock-btn dock-audio-btn" id="audioToggleBtn" aria-pressed="false">
+        <span class="dock-audio-indicator" id="audioIndicator" aria-hidden="true"></span>
+        <span id="audioToggleLabel">开启语音</span>
+      </button>
+
+      <div class="dock-volume">
+        <label for="volumeRange" class="sr-only">音量</label>
+        <input type="range" id="volumeRange" min="0" max="1.5" step="0.05" value="1" />
+      </div>
+
+      <button type="button" class="dock-btn" id="sourceToggleBtn" aria-pressed="false" title="显示或隐藏源语言转写">
+        原文
+      </button>
+
+      <div class="dock-font-group">
+        <button type="button" class="dock-btn dock-compact" id="fontDownBtn" aria-label="减小字号">A-</button>
+        <button type="button" class="dock-btn dock-compact" id="fontUpBtn" aria-label="增大字号">A+</button>
+      </div>
+    </footer>
+  </div>
+
+  <script type="module" src="/static/listen.js"></script>
+</body>
+</html>
