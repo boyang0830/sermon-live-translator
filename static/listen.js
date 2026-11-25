@@ -1,4 +1,4 @@
-import { Pcm24kPlayer } from "/static/audio-player.js?v=3";
+import { Pcm24kPlayer } from "/static/audio-player.js?v=4";
 
 const PREFS_KEY = "sermon_listener_prefs_v2";
 const PIN_SESSION_KEY = "sermon_listener_pin";
@@ -789,6 +789,10 @@ function connectListenerWs() {
   ws.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) {
       handleBinaryAudio(event.data);
+      return;
+    }
+    if (event.data instanceof Blob) {
+      event.data.arrayBuffer().then(handleBinaryAudio).catch(() => {});
       return;
     }
     try {

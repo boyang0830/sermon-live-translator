@@ -22,30 +22,36 @@ for (let i = 0; i < 256; i++) {
   ULAW_DECODE_LUT[i] = sample / 32768;
 }
 
-/** Generate a tiny 1-second silent PCM WAV Blob URL to hold iOS AVAudioSession Playback open. */
-function createSilentWavUrl() {
-  const sampleRate = 8000;
-  const numSamples = sampleRate; // 1 second of 8-bit unsigned silence (0x80)
-  const buf = new ArrayBuffer(44 + numSamples);
+/** Generate a standard 16-bit 44.1kHz mono silent WAV Data URI (100% Apple CoreAudio compatible). */
+function createSilentWavDataUri() {
+  const sampleRate = 44100;
+  const numSamples = 4410; // 100ms loop of 16-bit signed silence (0x0000) -> ~8.8 KB
+  const dataBytes = numSamples * 2;
+  const buf = new ArrayBuffer(44 + dataBytes);
   const v = new DataView(buf);
   const writeStr = (off, s) => {
     for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
   };
   writeStr(0, "RIFF");
-  v.setUint32(4, 36 + numSamples, true);
+  v.setUint32(4, 36 + dataBytes, true);
   writeStr(8, "WAVE");
   writeStr(12, "fmt ");
   v.setUint32(16, 16, true); // PCM chunk size
   v.setUint16(20, 1, true); // PCM format
   v.setUint16(22, 1, true); // mono
   v.setUint32(24, sampleRate, true);
-  v.setUint32(28, sampleRate, true); // byte rate
-  v.setUint16(32, 1, true); // block align
-  v.setUint16(34, 8, true); // 8-bit unsigned PCM
+  v.setUint32(28, sampleRate * 2, true); // byte rate
+  v.setUint16(32, 2, true); // block align (16-bit mono)
+  v.setUint16(34, 16, true); // bits per sample
   writeStr(36, "data");
-  v.setUint32(40, numSamples, true);
-  new Uint8Array(buf, 44).fill(0x80);
-  return URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+  v.setUint32(40, dataBytes, true);
+  // ArrayBuffer is zero-initialized (16-bit signed silence = 0)
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return `data:audio/wav;base64,${btoa(bin)}`;
 }
 
 export class Pcm24kPlayer {
@@ -73,7 +79,9 @@ export class Pcm24kPlayer {
 
     // Background / lock-screen keepalive <audio> for iOS Safari & Android Chrome
     this._keepAliveAudio = null;
-    this._keepAliveUrl = null;
+    if (this.enableKeepAlive && typeof document !== "undefined") {
+      this._prepareKeepAliveElement();
+    }
 
     // Stabilized audio playback timeline tracking for subtitle highlighting
     this.onActiveTurnChange = typeof onActiveTurnChange === "function" ? onActiveTurnChange : null;
@@ -86,21 +94,44 @@ export class Pcm24kPlayer {
     this._holdTimer = null;
   }
 
+  _prepareKeepAliveElement() {
+    if (this._keepAliveAudio || typeof document === "undefined") return;
+    const audio = document.createElement("audio");
+    audio.src = createSilentWavDataUri();
+    audio.loop = true;
+    audio.playsInline = true;
+    audio.setAttribute("playsinline", "");
+    audio.setAttribute("webkit-playsinline", "");
+    audio.setAttribute("x-webkit-airplay", "deny");
+    audio.preload = "auto";
+    audio.style.display = "none";
+    if (document.body) {
+      document.body.appendChild(audio);
+    }
+    this._keepAliveAudio = audio;
+  }
+
+  _activatePlaybackAudioSession() {
+    // Official Safari 17+ Web AudioSession API: plays Web Audio even with iPhone silent switch ON
+    if (typeof navigator !== "undefined" && navigator.audioSession) {
+      try {
+        navigator.audioSession.type = "playback";
+      } catch {
+        // Ignore on browsers where audioSession is read-only
+      }
+    }
+  }
+
   _startKeepAlive() {
     if (!this.enableKeepAlive) return;
-    if (!this._keepAliveAudio) {
-      this._keepAliveUrl = createSilentWavUrl();
-      const audio = document.createElement("audio");
-      audio.src = this._keepAliveUrl;
-      audio.loop = true;
-      audio.playsInline = true;
-      audio.setAttribute("playsinline", "");
-      audio.setAttribute("webkit-playsinline", "");
-      audio.preload = "auto";
-      audio.volume = 0.01;
-      this._keepAliveAudio = audio;
+    this._activatePlaybackAudioSession();
+    this._prepareKeepAliveElement();
+    if (this._keepAliveAudio) {
+      if (!this._keepAliveAudio.isConnected && document.body) {
+        document.body.appendChild(this._keepAliveAudio);
+      }
+      this._keepAliveAudio.play().catch(() => {});
     }
-    this._keepAliveAudio.play().catch(() => {});
 
     if ("mediaSession" in navigator) {
       try {
@@ -134,10 +165,13 @@ export class Pcm24kPlayer {
   }
 
   async ensureReady() {
+    // CRITICAL FOR iOS / macOS SAFARI:
+    // Perform AudioSession switch, AudioContext creation, silent buffer start, ctx.resume(),
+    // and keepalive <audio>.play() ALL SYNCHRONOUSLY inside the user tap before ANY `await`!
+    this._activatePlaybackAudioSession();
+
     if (!this.ctx) {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      // Use native device sampleRate (48k/44.1k) rather than forcing 24000Hz:
-      // prevents iOS Safari & Bluetooth/AirPods sample-rate pitch/timbre distortion.
       this.ctx = new AudioCtx();
       this.gainNode = this.ctx.createGain();
       this.gainNode.gain.value = this.muted ? 0 : this.volume;
@@ -147,23 +181,11 @@ export class Pcm24kPlayer {
         const st = this.ctx ? this.ctx.state : "closed";
         this.onStateChange?.(st);
       };
-
-      if (this.sinkId && typeof this.ctx.setSinkId === "function") {
-        try {
-          await this.ctx.setSinkId(this.sinkId);
-        } catch (err) {
-          console.warn("Failed to set initial audio output device:", err);
-        }
-      }
     }
 
-    if (this.ctx.state !== "running") {
-      await this.ctx.resume();
-    }
-
-    // Unlock iOS Safari Web Audio inside the user gesture
+    // 1. Synchronous silent Web Audio unlock (required by WebKit)
     try {
-      const silent = this.ctx.createBuffer(1, 1, this.sampleRate);
+      const silent = this.ctx.createBuffer(1, 1, this.ctx.sampleRate || 44100);
       const src = this.ctx.createBufferSource();
       src.buffer = silent;
       src.connect(this.ctx.destination);
@@ -172,9 +194,30 @@ export class Pcm24kPlayer {
       // Ignore
     }
 
+    // 2. Synchronous ctx.resume() (do NOT await yet!)
+    let resumePromise = null;
+    if (this.ctx.state !== "running") {
+      resumePromise = this.ctx.resume().catch(() => {});
+    }
+
+    // 3. Synchronous <audio>.play() while still inside Safari's user-gesture call stack
     if (!this.muted) {
       this._startKeepAlive();
     }
+
+    // 4. Now safe to await asynchronous state transitions
+    if (resumePromise) {
+      await resumePromise;
+    }
+
+    if (this.sinkId && typeof this.ctx.setSinkId === "function") {
+      try {
+        await this.ctx.setSinkId(this.sinkId);
+      } catch (err) {
+        console.warn("Failed to set initial audio output device:", err);
+      }
+    }
+
     this.onStateChange?.(this.ctx.state);
     return this.ctx.state === "running";
   }
@@ -218,18 +261,27 @@ export class Pcm24kPlayer {
   setVolume(value) {
     this.volume = Math.max(0, Math.min(1.5, Number(value)));
     if (this.gainNode && !this.muted && this.ctx) {
-      this.gainNode.gain.setTargetAtTime(this.volume, this.ctx.currentTime, 0.015);
+      const now = this.ctx.currentTime;
+      if (now > 0) {
+        this.gainNode.gain.cancelScheduledValues(now);
+        this.gainNode.gain.setTargetAtTime(this.volume, now, 0.015);
+      } else {
+        this.gainNode.gain.value = this.volume;
+      }
     }
   }
 
   setMuted(muted) {
     this.muted = Boolean(muted);
     if (this.gainNode && this.ctx) {
-      this.gainNode.gain.setTargetAtTime(
-        this.muted ? 0 : this.volume,
-        this.ctx.currentTime,
-        0.015
-      );
+      const target = this.muted ? 0 : this.volume;
+      const now = this.ctx.currentTime;
+      if (now > 0) {
+        this.gainNode.gain.cancelScheduledValues(now);
+        this.gainNode.gain.setTargetAtTime(target, now, 0.015);
+      } else {
+        this.gainNode.gain.value = target;
+      }
     }
     if (this.muted) {
       this._stopKeepAlive();
@@ -363,7 +415,7 @@ export class Pcm24kPlayer {
     }
 
     const audioBuffer = this.ctx.createBuffer(1, float32.length, rate);
-    audioBuffer.copyToChannel(float32, 0);
+    audioBuffer.getChannelData(0).set(float32);
 
     const source = this.ctx.createBufferSource();
     source.buffer = audioBuffer;
@@ -433,9 +485,8 @@ export class Pcm24kPlayer {
   async close() {
     this.clearQueue();
     this._stopKeepAlive();
-    if (this._keepAliveUrl) {
-      URL.revokeObjectURL(this._keepAliveUrl);
-      this._keepAliveUrl = null;
+    if (this._keepAliveAudio) {
+      this._keepAliveAudio.remove();
       this._keepAliveAudio = null;
     }
     if (this.ctx) {
