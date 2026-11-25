@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>教会主日同声传译台 · Sermon Live Translator</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-dot" id="liveDot" aria-hidden="true"></div>
+      <div>
+        <h1>教会主日同声传译台</h1>
+        <p class="subtitle" id="headerSubtitle">Mandarin → American English · Qwen3.8-LiveTranslate (单机音控版)</p>
+      </div>
+    </div>
+
+    <div class="topbar-meta">
+      <div class="status-pill" id="statusPill" role="status" aria-live="polite">待机</div>
+      <div class="metric-chip" title="本次运行时间">
+        <span class="metric-label">时长</span>
+        <span class="metric-value" id="timerDisplay">00:00</span>
+      </div>
+      <div class="metric-chip" title="按当前音频/Token 实时估算的 API 费用">
+        <span class="metric-label">估算费用</span>
+        <span class="metric-value" id="costDisplay">¥0.000</span>
+      </div>
+      <button type="button" class="btn btn-ghost" id="fullscreenBtn" title="打开全屏同传字幕模式（适合投屏）">
+        全屏字幕
+      </button>
+      <button type="button" class="btn btn-ghost" id="themeToggleBtn" title="切换深色/浅色主题">
+        切换浅色
+      </button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <!-- Left Column: Soundbooth Controls & Audio Routing -->
+    <aside class="control-panel">
+      <section class="card">
+        <div class="card-header">
+          <h2>音控主开关</h2>
+          <span class="hint" id="connectionHint">准备就绪</span>
+        </div>
+
+        <!-- Bidirectional Translation Switcher -->
+        <div class="direction-group" role="radiogroup" aria-label="翻译方向">
+          <button
+            type="button"
+            class="direction-btn active"
+            id="dirZhEnBtn"
+            data-direction="zh-en"
+            role="radio"
+            aria-checked="true"
+          >
+            <span class="dir-main">中文 → 英文</span>
+            <span class="dir-sub">中译英 (American English)</span>
+          </button>
+          <button
+            type="button"
+            class="direction-btn"
+            id="dirEnZhBtn"
+            data-direction="en-zh"
+            role="radio"
+            aria-checked="false"
+          >
+            <span class="dir-main">英文 → 中文</span>
+            <span class="dir-sub">英译中 (简体普通话)</span>
+          </button>
+        </div>
+
+        <!-- Quick Model Selector -->
+        <div class="field compact-field">
+          <label for="modelSelect">当前同传模型</label>
+          <select id="modelSelect"></select>
+          <p class="field-help" id="modelDescription"></p>
+        </div>
+
+        <div class="primary-actions">
+          <button type="button" class="btn btn-primary btn-lg" id="startBtn">
+            开始实时翻译
+          </button>
+          <button type="button" class="btn btn-warning btn-lg" id="pauseBtn" disabled>
+            静音暂停（唱诗/祷告）
+          </button>
+          <button type="button" class="btn btn-danger btn-lg" id="stopBtn" disabled>
+            停止
+          </button>
+        </div>
+
+        <!-- Input Level VU Meter -->
+        <div class="meter-block">
+          <div class="meter-header">
+            <label for="vuMeter">输入电平（调音台 / 麦克风）</label>
+            <span id="vuText" class="mono">0%</span>
+          </div>
+          <div class="vu-track" id="vuMeter" aria-hidden="true">
+            <div class="vu-fill" id="vuFill"></div>
+          </div>
+        </div>
+
+        <!-- Alert / Error Banner -->
+        <div class="banner hidden" id="alertBanner" role="alert"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>音频设备与路由</h2>
+          <button type="button" class="btn btn-sm btn-ghost" id="refreshDevicesBtn">
+            刷新设备
+          </button>
+        </div>
+
+        <div class="field">
+          <label for="inputDeviceSelect">输入源（建议选调音台 USB 声卡 / Line-Out）</label>
+          <select id="inputDeviceSelect">
+            <option value="">默认麦克风 / 音频输入</option>
+          </select>
+        </div>
+
+        <div class="checkbox-row">
+          <input type="checkbox" id="mixerCleanMode" />
+          <label for="mixerCleanMode">
+            <strong>调音台直连纯净模式</strong>（关闭浏览器回声消除与自动增益，避免吞掉讲员轻声尾音；用电脑自带麦克风时请勿勾选）
+          </label>
+        </div>
+
+        <div class="field">
+          <label for="outputDeviceSelect">同传语音输出设备（可独立指定无线同传发射机）</label>
+          <select id="outputDeviceSelect">
+            <option value="">系统默认输出</option>
+          </select>
+          <p class="field-help" id="outputDeviceHelp">
+            Chrome / Edge 支持将同传语音直接路由到外接 USB 声卡或无线发射器。
+          </p>
+        </div>
+
+        <div class="volume-row">
+          <label for="volumeSlider">同传输出音量</label>
+          <input type="range" id="volumeSlider" min="0" max="1.5" step="0.05" value="1" />
+          <span id="volumeValue" class="mono">100%</span>
+          <button type="button" class="btn btn-sm btn-ghost" id="muteOutputBtn">静音输出</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>本周讲道预热（提升口音与专有名词识别）</h2>
+        </div>
+        <div class="field">
+          <label for="sermonContextInput">经文范围、主题与临时术语（开始前填写生效）</label>
+          <textarea id="sermonContextInput" rows="4"></textarea>
+        </div>
+      </section>
+
+      <section class="card">
+        <details id="advancedDetails">
+          <summary class="card-summary">模型参数、API Key 与术语/口译规则设置</summary>
+
+          <div class="details-body">
+            <!-- Qwen3.8 (DashScope) Settings -->
+            <div id="qwenSettingsGroup">
+              <div class="field">
+                <label for="qwenTransportSelect">连接传输协议</label>
+                <select id="qwenTransportSelect"></select>
+              </div>
+
+              <div class="field">
+                <label for="dashscopeWorkspaceInput">业务空间 ID（WebRTC 直连必填 · 如 <code>ws-...</code> 或 <code>llm-...</code>）</label>
+                <input
+                  type="text"
+                  id="dashscopeWorkspaceInput"
+                  autocomplete="off"
+                  placeholder="如已在 .env 配置可留空（例：ws-xxxxxxxxxxxx）"
+                />
+                <p class="field-help" id="workspaceHelp">
+                  登录 <a href="https://bailian.console.aliyun.com/" target="_blank" rel="noopener">阿里云百炼控制台</a> → 点击「业务空间管理」→ 复制业务空间 ID。
+                </p>
+              </div>
+
+              <div class="field">
+                <label for="dashscopeRegionSelect">阿里云百炼地域</label>
+                <select id="dashscopeRegionSelect"></select>
+              </div>
+
+              <div class="field">
+                <label for="qwenVoiceModeSelect">同传音色模式</label>
+                <select id="qwenVoiceModeSelect"></select>
+                <p class="field-help">
+                  Qwen3.8-LiveTranslate 官方仅内置女声 <code>Tina</code>（不支持 <code>Zane</code> 等 Omni 预设男声）；开启「实时声音复刻」会自动免费克隆牧师男声播报！
+                </p>
+              </div>
+
+              <div class="field hidden" id="qwenCustomVoiceField">
+                <label for="qwenCustomVoiceInput">自定义预建音色 ID（Voice ID）</label>
+                <input
+                  type="text"
+                  id="qwenCustomVoiceInput"
+                  autocomplete="off"
+                  placeholder="粘贴通过百炼声音复刻 API 创建的 voice_id"
+                />
+              </div>
+
+              <div class="field">
+                <label for="qwenVadModeSelect">断句与收音灵敏度（VAD 模式）</label>
+                <select id="qwenVadModeSelect"></select>
+              </div>
+
+              <div class="field">
+                <label for="dashscopeApiKeyInput">阿里云百炼 API Key (DASHSCOPE_API_KEY)</label>
+                <div class="input-action-row">
+                  <input
+                    type="password"
+                    id="dashscopeApiKeyInput"
+                    autocomplete="off"
+                    placeholder="填入后自动记住（切换模型/刷新不丢失）"
+                  />
+                  <button type="button" class="btn btn-sm btn-ghost" id="clearDashscopeKeyBtn" title="清空已保存的阿里云百炼 API Key">
+                    清空 Key
+                  </button>
+                </div>
+                <p class="field-help" id="dashscopeKeyHelp">检查服务端 .env 配置中...</p>
+              </div>
+
+              <div class="field">
+                <div class="label-row">
+                  <label for="glossaryInput" id="glossaryLabel">神学术语词典（corpus.phrases · 中文 → 英文）</label>
+                  <button type="button" class="btn btn-sm btn-ghost" id="resetGlossaryBtn">恢复默认词表</button>
+                </div>
+                <textarea id="glossaryInput" rows="8"></textarea>
+                <p class="field-help">
+                  每行一条 <code>原词=译文</code>，会自动与上方「本周讲道预热」中的术语合并传给 Qwen3.8。
+                </p>
+              </div>
+            </div>
+
+            <!-- Gemini Live API Settings -->
+            <div id="geminiSettingsGroup" class="hidden">
+              <div class="field">
+                <label for="apiKeyInput">Google AI Studio API Key (GEMINI_API_KEY)</label>
+                <div class="input-action-row">
+                  <input
+                    type="password"
+                    id="apiKeyInput"
+                    autocomplete="off"
+                    placeholder="填入后自动记住（切换模型/刷新不丢失）"
+                  />
+                  <button type="button" class="btn btn-sm btn-ghost" id="clearGeminiKeyBtn" title="清空已保存的 Gemini API Key">
+                    清空 Key
+                  </button>
+                </div>
+                <p class="field-help" id="apiKeyHelp">检查服务端 .env 配置中...</p>
+              </div>
+
+              <div class="two-col">
+                <div class="field">
+                  <label for="compressionTriggerInput">上下文压缩阈值 (Tokens)</label>
+                  <input type="number" id="compressionTriggerInput" min="2000" max="32000" step="500" value="4500" />
+                </div>
+                <div class="field">
+                  <label for="compressionTargetInput">压缩后保留窗口 (Tokens)</label>
+                  <input type="number" id="compressionTargetInput" min="1000" max="16000" step="500" value="2500" />
+                </div>
+              </div>
+
+              <div class="checkbox-row">
+                <input type="checkbox" id="echoTargetCheckbox" />
+                <label for="echoTargetCheckbox">
+                  开启 <code>echo_target_language</code>（讲员直接说出目标语言短句时原样复述；有背景音乐时建议关闭）
+                </label>
+              </div>
+
+              <div class="field">
+                <div class="label-row">
+                  <label for="rulesInput" id="rulesLabel">口译规则（System Instruction · 中文 → 英文）</label>
+                  <button type="button" class="btn btn-sm btn-ghost" id="resetRulesBtn">恢复默认</button>
+                </div>
+                <textarea id="rulesInput" rows="10"></textarea>
+              </div>
+            </div>
+
+            <div class="checkbox-row">
+              <input type="checkbox" id="saveTranscriptCheckbox" checked />
+              <label for="saveTranscriptCheckbox">
+                自动将双语字幕存档到 <code>logs/</code> 目录
+              </label>
+            </div>
+          </div>
+        </details>
+      </section>
+    </aside>
+
+    <!-- Right Column: Resizable Target Captions + Source Reference -->
+    <section class="caption-panel" id="splitContainer">
+      <div class="card caption-card" id="targetPane">
+        <div class="card-header">
+          <div>
+            <h2 id="targetPaneTitle">实时英文同传字幕 · Live American English</h2>
+            <p class="field-help" id="logFileHint">语音输出时对应字幕将自动高亮显示</p>
+          </div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-sm btn-ghost" id="fontSmallerBtn" title="减小字号">A-</button>
+            <button type="button" class="btn btn-sm btn-ghost" id="fontLargerBtn" title="增大字号">A+</button>
+            <button type="button" class="btn btn-sm btn-ghost" id="exportBtn">导出文字稿</button>
+            <button type="button" class="btn btn-sm btn-ghost" id="clearCaptionsBtn">清空</button>
+          </div>
+        </div>
+
+        <div class="caption-stream" id="targetStream" aria-live="polite">
+          <div class="empty-state" id="targetEmptyState">
+            点击左侧「开始实时翻译」，讲员发言时此处将实时滚动同传字幕，并在语音播报时自动高亮当前句子。
+          </div>
+        </div>
+      </div>
+
+      <!-- Draggable Horizontal Splitter -->
+      <div
+        class="pane-splitter"
+        id="paneSplitter"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="上下拖动调整同传字幕与收音转写框高度（双击重置比例）"
+        aria-valuemin="25"
+        aria-valuemax="85"
+        aria-valuenow="68"
+        tabindex="0"
+        title="上下拖动调整两个方框高度（双击恢复默认比例）"
+      >
+        <div class="splitter-grip" aria-hidden="true"></div>
+      </div>
+
+      <div class="card source-card" id="sourcePane">
+        <div class="card-header source-header">
+          <div class="source-title-wrap">
+            <h2 id="sourcePaneTitle">中文收音转写参考 · Mandarin Input Transcript</h2>
+            <span class="summary-note">（重口音时源语言转写偶有偏差，最终同传语音仍具更高准确度）</span>
+          </div>
+          <button type="button" class="btn btn-sm btn-ghost" id="toggleSourceBtn" aria-expanded="true">
+            收起
+          </button>
+        </div>
+        <div class="source-stream" id="sourceStream" aria-live="polite">
+          <div class="empty-state" id="sourceEmptyState">暂无收音转写参考</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Fullscreen Subtitle Overlay -->
+  <div class="fullscreen-overlay hidden" id="fullscreenOverlay" role="dialog" aria-modal="true" aria-label="全屏同传字幕">
+    <div class="fullscreen-bar">
+      <div class="fullscreen-status">
+        <span class="brand-dot" id="fsDot" aria-hidden="true"></span>
+        <span id="fsTitle">Live English Interpretation</span>
+      </div>
+      <div class="toolbar">
+        <button type="button" class="btn btn-sm btn-ghost" id="fsFontSmallerBtn">A-</button>
+        <button type="button" class="btn btn-sm btn-ghost" id="fsFontLargerBtn">A+</button>
+        <button type="button" class="btn btn-sm btn-ghost" id="exitFullscreenBtn">退出全屏 (Esc)</button>
+      </div>
+    </div>
+    <div class="fullscreen-body" id="fullscreenCaptions" aria-live="polite">
+      <p class="fs-placeholder">Waiting for live interpretation...</p>
+    </div>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
