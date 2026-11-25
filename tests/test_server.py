@@ -358,6 +358,8 @@ def test_mode2_listener_page_qrcode_and_tunnel_admin_protection():
         ).status_code
         == 403
     )
+    assert client.post("/api/broadcast/tunnel/start", headers=tunnel_headers).status_code == 403
+    assert client.post("/api/broadcast/tunnel/stop", headers=tunnel_headers).status_code == 403
 
     # Public broadcast status omits admin-only fields for proxied requests
     r_pub_status = client.get("/api/broadcast/status", headers=tunnel_headers)

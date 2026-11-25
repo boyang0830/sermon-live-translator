@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import deque
+from contextlib import asynccontextmanager
 import datetime
 import io
 import json
 import logging
 import os
 import re
+import shutil
 import socket
 import struct
 import time
@@ -927,6 +929,9 @@ class BroadcastHub:
                     "room_pin": self.room_pin,
                     "model": self.model,
                     "transport": self.transport,
+                    "tunnel_installed": tunnel_manager.is_installed(),
+                    "tunnel_running": tunnel_manager.is_running(),
+                    "tunnel_url": tunnel_manager.url,
                 }
             )
         return snap
@@ -1089,7 +1094,133 @@ class BroadcastHub:
             await self._broadcast_to_listeners_json(payload)
 
 
-# Global Mode 2 broadcast hub shared across soundbooth and all congregation mobile listeners
+_TRYCLOUDFLARE_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+
+class CloudflaredTunnelManager:
+    """Manages an optional one-click Cloudflare Quick Tunnel for 5G / cellular congregation access."""
+
+    def __init__(self) -> None:
+        self._proc: asyncio.subprocess.Process | None = None
+        self._drain_task: asyncio.Task[None] | None = None
+        self.url: str = ""
+        self._lock = asyncio.Lock()
+
+    def find_binary(self) -> str | None:
+        for candidate in (
+            shutil.which("cloudflared"),
+            "/opt/homebrew/bin/cloudflared",
+            "/usr/local/bin/cloudflared",
+            str(BASE_DIR / ".venv" / "bin" / "cloudflared"),
+        ):
+            if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    def is_installed(self) -> bool:
+        return self.find_binary() is not None
+
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.returncode is None
+
+    async def start(self, port: int = 8765, timeout: float = 20.0) -> str:
+        async with self._lock:
+            if self.is_running() and self.url:
+                broadcast_hub.public_url = self.url
+                return self.url
+
+            binary = self.find_binary()
+            if not binary:
+                raise RuntimeError(
+                    "本机未安装 cloudflared。请在终端执行 `brew install cloudflared` 后重试。"
+                )
+
+            await self._stop_unlocked()
+
+            proc = await asyncio.create_subprocess_exec(
+                binary,
+                "tunnel",
+                "--no-autoupdate",
+                "--url",
+                f"http://127.0.0.1:{port}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self._proc = proc
+            self.url = ""
+
+            found_event = asyncio.Event()
+            recent_lines: deque[str] = deque(maxlen=15)
+
+            async def drain(stream: asyncio.StreamReader | None) -> None:
+                if stream is None:
+                    return
+                try:
+                    while True:
+                        line_bytes = await stream.readline()
+                        if not line_bytes:
+                            break
+                        text = line_bytes.decode("utf-8", errors="ignore").strip()
+                        if text:
+                            recent_lines.append(text)
+                            match = _TRYCLOUDFLARE_RE.search(text)
+                            if match and not self.url:
+                                self.url = match.group(0)
+                                found_event.set()
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    return
+
+            t_err = asyncio.create_task(drain(proc.stderr))
+            t_out = asyncio.create_task(drain(proc.stdout))
+            self._drain_task = asyncio.create_task(
+                asyncio.gather(t_err, t_out, return_exceptions=True)  # type: ignore[arg-type]
+            )
+
+            try:
+                await asyncio.wait_for(found_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                await self._stop_unlocked()
+                detail = " | ".join(list(recent_lines)[-3:])
+                raise RuntimeError(f"启动 Cloudflare 5G 公网隧道超时：{detail or '请检查网络连接'}")
+
+            broadcast_hub.public_url = self.url
+            logger.info("Cloudflare 5G Quick Tunnel active: %s -> http://127.0.0.1:%d", self.url, port)
+            return self.url
+
+    async def _stop_unlocked(self) -> None:
+        old_url = self.url
+        self.url = ""
+        if self._proc is not None:
+            proc = self._proc
+            self._proc = None
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            try:
+                await self._drain_task
+            except asyncio.CancelledError:
+                pass
+            self._drain_task = None
+        if old_url and broadcast_hub.public_url == old_url:
+            broadcast_hub.public_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+
+    async def stop(self) -> None:
+        async with self._lock:
+            await self._stop_unlocked()
+
+
+# Global Mode 2 broadcast hub & 5G public tunnel manager
+tunnel_manager = CloudflaredTunnelManager()
 broadcast_hub = BroadcastHub()
 
 
@@ -2646,6 +2777,31 @@ async def ws_listen(websocket: WebSocket) -> None:
         await broadcast_hub.unregister_listener(websocket)
 
 
+async def api_broadcast_tunnel_start(request: Request) -> JSONResponse:
+    """Start a free Cloudflare Quick Tunnel so phones on 5G cellular can connect via HTTPS/WSS."""
+    if not is_local_admin_request(request):
+        return JSONResponse({"error": "仅限本机音控台访问"}, status_code=403)
+    req_port = request.url.port or int(os.getenv("PORT", "8765"))
+    try:
+        await tunnel_manager.start(port=req_port)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return JSONResponse(
+        broadcast_hub.build_status_snapshot(include_admin=True, port=req_port)
+    )
+
+
+async def api_broadcast_tunnel_stop(request: Request) -> JSONResponse:
+    """Stop the running Cloudflare Quick Tunnel and fall back to LAN Wi-Fi."""
+    if not is_local_admin_request(request):
+        return JSONResponse({"error": "仅限本机音控台访问"}, status_code=403)
+    await tunnel_manager.stop()
+    req_port = request.url.port or int(os.getenv("PORT", "8765"))
+    return JSONResponse(
+        broadcast_hub.build_status_snapshot(include_admin=True, port=req_port)
+    )
+
+
 routes = [
     Route("/", homepage),
     Route("/listen", listen_page),
@@ -2656,6 +2812,8 @@ routes = [
     Route("/api/transcript/log", api_transcript_log, methods=["POST"]),
     Route("/api/broadcast/status", api_broadcast_status),
     Route("/api/broadcast/settings", api_broadcast_settings, methods=["POST"]),
+    Route("/api/broadcast/tunnel/start", api_broadcast_tunnel_start, methods=["POST"]),
+    Route("/api/broadcast/tunnel/stop", api_broadcast_tunnel_stop, methods=["POST"]),
     Route("/api/qrcode", api_qrcode),
     WebSocketRoute("/ws/translate", ws_translate),
     WebSocketRoute("/ws/broadcast", ws_broadcast),
@@ -2663,7 +2821,15 @@ routes = [
     Mount("/static", app=StaticFiles(directory=STATIC_DIR), name="static"),
 ]
 
-app = Starlette(routes=routes)
+@asynccontextmanager
+async def lifespan(_app: Starlette):
+    try:
+        yield
+    finally:
+        await tunnel_manager.stop()
+
+
+app = Starlette(routes=routes, lifespan=lifespan)
 
 if __name__ == "__main__":
     import uvicorn

@@ -101,6 +101,7 @@ const el = {
   broadcastUrlType: document.getElementById("broadcastUrlType"),
   broadcastListenUrl: document.getElementById("broadcastListenUrl"),
   openQrModalBtn: document.getElementById("openQrModalBtn"),
+  toggleTunnelBtn: document.getElementById("toggleTunnelBtn"),
   copyListenUrlBtn: document.getElementById("copyListenUrlBtn"),
   publicUrlInput: document.getElementById("publicUrlInput"),
   roomPinInput: document.getElementById("roomPinInput"),
@@ -131,6 +132,9 @@ const state = {
     lanListenUrl: "",
     publicUrl: "",
     roomPin: "",
+    tunnelInstalled: false,
+    tunnelRunning: false,
+    tunnelBusy: false,
   },
   webrtcClient: null,
   activeTransport: "websocket", // "webrtc" | "websocket"
@@ -940,13 +944,32 @@ function renderBroadcastInfo(info) {
   state.broadcastInfo.lanListenUrl = info.lan_listen_url || "";
   state.broadcastInfo.publicUrl = info.public_url || "";
   state.broadcastInfo.roomPin = info.room_pin || "";
+  if (info.tunnel_installed !== undefined) {
+    state.broadcastInfo.tunnelInstalled = Boolean(info.tunnel_installed);
+  }
+  if (info.tunnel_running !== undefined) {
+    state.broadcastInfo.tunnelRunning = Boolean(info.tunnel_running);
+  }
   updateListenerCountUI(info.listener_count ?? state.broadcastInfo.listenerCount);
+
+  if (el.toggleTunnelBtn && !state.broadcastInfo.tunnelBusy) {
+    if (state.broadcastInfo.tunnelRunning) {
+      el.toggleTunnelBtn.textContent = "关闭 5G 穿透";
+      el.toggleTunnelBtn.classList.add("btn-tunnel-active");
+    } else {
+      el.toggleTunnelBtn.textContent = "开启 5G 公网穿透";
+      el.toggleTunnelBtn.classList.remove("btn-tunnel-active");
+    }
+    el.toggleTunnelBtn.disabled = false;
+  }
 
   const isPublic = Boolean(info.public_url);
   if (el.broadcastUrlType) {
-    el.broadcastUrlType.textContent = isPublic
-      ? "公网穿透收听地址（Wi-Fi 与 5G 通用）"
-      : "局域网 Wi-Fi 收听地址（会众连教会 Wi-Fi 扫码）";
+    el.broadcastUrlType.textContent = state.broadcastInfo.tunnelRunning
+      ? "5G 公网穿透已开启（Wi-Fi 与 5G 手机均可扫码）"
+      : isPublic
+        ? "公网穿透收听地址（Wi-Fi 与 5G 通用）"
+        : "仅局域网 Wi-Fi 地址（5G 手机请先点下方「开启 5G 公网穿透」）";
   }
   if (el.broadcastListenUrl && info.effective_listen_url) {
     el.broadcastListenUrl.textContent = info.effective_listen_url;
@@ -1021,6 +1044,46 @@ async function copyListenUrl(buttonEl) {
     }, 1800);
   } catch {
     showBanner(`请手动复制听众收听链接：${url}`, "info");
+  }
+}
+
+async function togglePublicTunnel() {
+  if (state.broadcastInfo.tunnelBusy) return;
+  const starting = !state.broadcastInfo.tunnelRunning;
+  state.broadcastInfo.tunnelBusy = true;
+  if (el.toggleTunnelBtn) {
+    el.toggleTunnelBtn.disabled = true;
+    el.toggleTunnelBtn.textContent = starting ? "正在建立 5G 隧道..." : "正在关闭...";
+  }
+  try {
+    const endpoint = starting ? "/api/broadcast/tunnel/start" : "/api/broadcast/tunnel/stop";
+    const res = await fetch(endpoint, { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showBanner(data.error || "切换 5G 公网穿透失败");
+      return;
+    }
+    hideBanner();
+    state.broadcastInfo.tunnelBusy = false;
+    renderBroadcastInfo(data);
+    if (starting) {
+      showBanner(
+        `5G 公网穿透已就绪！请让 5G 手机重新扫码或打开：${data.effective_listen_url}`,
+        "info"
+      );
+    } else {
+      showBanner("已关闭 5G 公网穿透，切回局域网 Wi-Fi 模式。", "info");
+    }
+  } catch (err) {
+    showBanner(`5G 公网穿透请求失败：${err.message}`);
+  } finally {
+    state.broadcastInfo.tunnelBusy = false;
+    if (el.toggleTunnelBtn) {
+      el.toggleTunnelBtn.disabled = false;
+      el.toggleTunnelBtn.textContent = state.broadcastInfo.tunnelRunning
+        ? "关闭 5G 穿透"
+        : "开启 5G 公网穿透";
+    }
   }
 }
 
@@ -1789,6 +1852,7 @@ async function init() {
   // Mode 2 Congregation Broadcast controls
   el.listenerChipBtn?.addEventListener("click", openQrModal);
   el.openQrModalBtn?.addEventListener("click", openQrModal);
+  el.toggleTunnelBtn?.addEventListener("click", togglePublicTunnel);
   el.closeQrModalBtn?.addEventListener("click", closeQrModal);
   el.qrModal?.addEventListener("click", (e) => {
     if (e.target === el.qrModal) closeQrModal();
